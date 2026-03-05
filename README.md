@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 2D Canonical Vorticity EMHD Solver (MPI + OpenMP)
 
 This project provides a modular C++ simulation code for 2D canonical vorticity evolution in EMHD:
@@ -40,3 +41,7 @@ Output files:
 - `output/step_XXXXXX_rank_YYYY.h5`
 
 Each file stores local slab data and metadata attributes (`global_nx`, `global_ny`, local offsets, spacing, time, etc.).
+=======
+# QHD
+Canonical vorticity based simulation
+>>>>>>> d102a9f6e42a4058bcac4d8153b2c360bd8b578e
