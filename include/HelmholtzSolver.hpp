@@ -6,8 +6,7 @@
 class HelmholtzSolver {
 public:
     HelmholtzSolver() = default;
-    HelmholtzSolver(int max_iter, double tol)
-        : max_iter_(max_iter), tol_(tol) {}
+    HelmholtzSolver([[maybe_unused]] int max_iter, [[maybe_unused]] double tol) {}
 
     void solve(const Grid2D& grid, const VectorField2D& q, VectorField2D& b) const;
 
@@ -16,6 +15,5 @@ private:
                          const std::vector<double>& q,
                          std::vector<double>& b) const;
 
-    int max_iter_ = 1200;
-    double tol_ = 1.0e-8;
+    static bool is_power_of_two(int n);
 };

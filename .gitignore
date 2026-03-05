@@ -3,4 +3,5 @@ output/
 *.h5
 *.o
 *.so
-.DS_Storebuild_local/
+.DS_Store
+build_local/
