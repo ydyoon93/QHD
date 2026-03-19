@@ -46,13 +46,35 @@ void define_field(const BoxArray& ba,
     }
 }
 
+void define_field(const BoxArray& ba,
+                  const DistributionMapping& dmap,
+                  const IntVect& ng,
+                  SymmetricTensorField2D& field) {
+    for (auto& comp : field.comp) {
+        comp.define(ba, dmap, 1, ng);
+        comp.setVal(0.0);
+    }
+}
+
 void copy(const VectorField2D& src, VectorField2D& dst) {
     for (int n = 0; n < 3; ++n) {
         MultiFab::Copy(dst.comp[n], src.comp[n], 0, 0, 1, 0);
     }
 }
 
+void copy(const SymmetricTensorField2D& src, SymmetricTensorField2D& dst) {
+    for (int n = 0; n < 6; ++n) {
+        MultiFab::Copy(dst.comp[n], src.comp[n], 0, 0, 1, 0);
+    }
+}
+
 void set_val(VectorField2D& dst, Real value) {
+    for (auto& comp : dst.comp) {
+        comp.setVal(value);
+    }
+}
+
+void set_val(SymmetricTensorField2D& dst, Real value) {
     for (auto& comp : dst.comp) {
         comp.setVal(value);
     }
@@ -75,6 +97,12 @@ void lincomb(VectorField2D& dst,
 }
 
 void fill_periodic(const Geometry& geom, VectorField2D& field) {
+    for (auto& comp : field.comp) {
+        comp.FillBoundary(geom.periodicity());
+    }
+}
+
+void fill_periodic(const Geometry& geom, SymmetricTensorField2D& field) {
     for (auto& comp : field.comp) {
         comp.FillBoundary(geom.periodicity());
     }

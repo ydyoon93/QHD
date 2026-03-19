@@ -6,3 +6,4 @@ output/
 .DS_Store
 output_smoke/
 QHD.code-workspace
+Backtrace*

@@ -1,7 +1,7 @@
 import numpy as np
 
-nx = 1024
-ny = 512
+nx = 512
+ny = 256
 lx = 40.0
 ly = 20.0
 dx = lx / nx
@@ -42,3 +42,24 @@ def By(x, y):
 
 def Bz(x, y):
     return B0 / np.cosh(_sheet_phase(y))
+
+
+pressure_closure_dependencies = ("u",)
+
+
+def pressure_closure(ctx):
+    ux = ctx["u"]["x"]
+    uy = ctx["u"]["y"]
+    uz = ctx["u"]["z"]
+    dx = ctx["dx"]
+    dy = ctx["dy"]
+    p_out = ctx["p_out"]
+
+    p_out["xx"][:] = -2.0 * nu * (ux - np.roll(ux, 1, axis=1)) / dx
+    p_out["xy"][:] = -nu * ((np.roll(ux, -1, axis=0) - ux) / dy + (np.roll(uy, -1, axis=1) - uy) / dx)
+    p_out["xz"][:] = -nu * (uz - np.roll(uz, 1, axis=1)) / dx
+    p_out["yy"][:] = -2.0 * nu * (uy - np.roll(uy, 1, axis=0)) / dy
+    p_out["yz"][:] = -nu * (uz - np.roll(uz, 1, axis=0)) / dy
+    p_out["zz"][:] = 0.0
+
+    return None

@@ -3,6 +3,7 @@
 #include <AMReX_ParallelDescriptor.H>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -52,6 +54,29 @@ std::string quote_shell_arg(const std::string& arg) {
     return quoted;
 }
 
+std::filesystem::path make_shared_temp_cfg_path() {
+    std::string path_string;
+    if (amrex::ParallelDescriptor::IOProcessor()) {
+        const auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        path_string =
+            (std::filesystem::temp_directory_path() /
+             ("qhd_python_cfg_" + std::to_string(ticks) + ".cfg"))
+                .string();
+    }
+
+    int size = static_cast<int>(path_string.size());
+    amrex::ParallelDescriptor::Bcast(&size, 1, amrex::ParallelDescriptor::IOProcessorNumber());
+    std::vector<char> buffer(static_cast<std::size_t>(size) + 1, '\0');
+    if (amrex::ParallelDescriptor::IOProcessor()) {
+        std::copy(path_string.begin(), path_string.end(), buffer.begin());
+    }
+    amrex::ParallelDescriptor::Bcast(buffer.data(), buffer.size(), amrex::ParallelDescriptor::IOProcessorNumber());
+    if (!amrex::ParallelDescriptor::IOProcessor()) {
+        path_string.assign(buffer.data(), static_cast<std::size_t>(size));
+    }
+    return std::filesystem::path(path_string);
+}
+
 } // namespace
 
 SimulationConfig SimulationConfig::from_file(const std::string& path) {
@@ -73,9 +98,7 @@ SimulationConfig SimulationConfig::from_file(const std::string& path) {
         }
 
         const auto abs_input = std::filesystem::absolute(path).lexically_normal();
-        const auto temp_cfg =
-            std::filesystem::temp_directory_path() /
-            ("qhd_python_cfg_" + std::to_string(static_cast<long long>(std::time(nullptr))) + ".cfg");
+        const auto temp_cfg = make_shared_temp_cfg_path();
 
         if (amrex::ParallelDescriptor::IOProcessor()) {
             std::ostringstream cmd;

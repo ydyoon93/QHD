@@ -288,7 +288,7 @@ def main() -> int:
     parser.add_argument(
         "--field",
         default="Bz",
-        choices=["Bx", "By", "Bz", "Ux", "Uy", "Uz", "Qx", "Qy", "Qz"],
+        choices=["Bx", "By", "Bz", "Ux", "Uy", "Uz", "Qx", "Qy", "Qz", "Pxx", "Pxy", "Pxz", "Pyy", "Pyz", "Pzz", "TrP"],
         help="Field component to reconstruct",
     )
     parser.add_argument("--save-npy", default=None, help="Optional output .npy path")

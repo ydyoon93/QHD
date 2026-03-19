@@ -35,6 +35,11 @@ The build expects OpenMP-enabled `fftw3` to be available because the Helmholtz
 inversion now uses AMReX FFT on CPU and links the threaded FFTW backend when
 `AMReX_OMP` is enabled.
 
+If you use Python-defined pressure closures, the build also needs Python 3
+development headers and `pybind11` headers. CMake first looks for a normal
+`pybind11` package and otherwise falls back to any local include tree that
+vendors the `pybind11` headers.
+
 ## Run
 
 ```bash
@@ -77,6 +82,41 @@ Those functions are evaluated on the solver staggering:
 If only `B` is provided, the solver computes `Q`.
 If only `Q` is provided, the solver solves for `B`.
 
+To override the default viscous closure, define
+
+- `pressure_closure(ctx)`
+
+in the Python namelist. It may either return a dict with the six independent
+symmetric components
+
+- `xx`, `xy`, `xz`, `yy`, `yz`, `zz`
+
+or write them in-place into `ctx["p_out"]` and return `None`.
+
+The closure is evaluated every timestep after `u` is updated from the latest `B`.
+The runtime now embeds Python with `pybind11`, so this happens in-process
+without spawning a new `python3` process or writing temporary `.npy` files per
+timestep.
+`ctx` contains:
+
+- `t`, `dt`, `step`
+- `nx`, `ny`, `lx`, `ly`, `dx`, `dy`
+- `p_out` as a dict of writable NumPy arrays for in-place output
+- `b`, `q`, `u`, `p` as dicts of NumPy arrays when requested by the closure
+- `coords` with staggered `x`/`y` meshes for `Bx`, `By`, `Bz`, `Qx`, `Qy`, `Qz`,
+  `Ux`, `Uy`, `Uz`, `Pxx`, `Pxy`, `Pxz`, `Pyy`, `Pyz`, `Pzz`
+
+If the namelist defines
+
+- `pressure_closure_dependencies = ("u",)`
+
+then only those input families are gathered into Python. Valid dependency names
+are `b`, `q`, `u`, and `p`. If `pressure_closure_dependencies` is omitted, all
+four are provided.
+
+If `pressure_closure` is absent, the solver falls back to the built-in symmetric
+viscous closure `P = -nu * (grad(u) + grad(u)^T)`.
+
 ## Output
 
 The solver writes standard AMReX plotfiles:
@@ -88,5 +128,8 @@ The solver writes cell-centered plotfile fields by averaging the staggered state
 - `Bx`, `By`, `Bz`
 - `Ux`, `Uy`, `Uz`
 - `Qx`, `Qy`, `Qz`
+- `Pxx`, `Pxy`, `Pxz`, `Pyy`, `Pyz`, `Pzz`
+- `TrP`
 
-The existing reader/viewer scripts still work on those plotfiles.
+The viewer uses the saved `TrP` field when it is present and only falls back to
+the old viscosity-based estimate for older plotfiles.
