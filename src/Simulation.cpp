@@ -1,209 +1,720 @@
 #include "Simulation.hpp"
 
+#include <AMReX.H>
+#include <AMReX_Array4.H>
+#include <AMReX_Box.H>
+#include <AMReX_MFIter.H>
+#include <AMReX_ParallelDescriptor.H>
+#include <AMReX_PlotFileUtil.H>
+#include <AMReX_Print.H>
+
 #include <algorithm>
+#include <cmath>
+#include <complex>
+#include <cstdlib>
+#include <cstdint>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
-#include <iostream>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
-
-#include "VectorOps.hpp"
+#include <vector>
 
 namespace {
 
-void reset_output_dir(const Grid2D& grid, const std::string& output_dir) {
-    if (output_dir.empty()) {
-        throw std::runtime_error("output_dir cannot be empty");
-    }
+using namespace amrex;
 
-    const std::filesystem::path dir_path(output_dir);
-    if (dir_path == "/" || dir_path == "." || dir_path == "..") {
-        throw std::runtime_error("Refusing to clear unsafe output_dir path: " + output_dir);
-    }
+constexpr double PI = 3.141592653589793238462643383279502884;
 
-    if (grid.rank == 0) {
-        std::error_code ec;
-        std::filesystem::remove_all(dir_path, ec);
-        if (ec) {
-            throw std::runtime_error("Failed to clear output directory '" + output_dir + "': " + ec.message());
+bool is_power_of_two(int n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+void fft_1d(std::vector<std::complex<double>>& a, bool inverse) {
+    const int n = static_cast<int>(a.size());
+
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        while ((j & bit) != 0) {
+            j ^= bit;
+            bit >>= 1;
         }
+        j ^= bit;
+        if (i < j) {
+            std::swap(a[i], a[j]);
+        }
+    }
 
-        std::filesystem::create_directories(dir_path, ec);
+    for (int len = 2; len <= n; len <<= 1) {
+        const double ang = 2.0 * PI / static_cast<double>(len) * (inverse ? 1.0 : -1.0);
+        const std::complex<double> wlen(std::cos(ang), std::sin(ang));
+
+        for (int i = 0; i < n; i += len) {
+            std::complex<double> w(1.0, 0.0);
+            const int half = len / 2;
+            for (int j = 0; j < half; ++j) {
+                const std::complex<double> u = a[i + j];
+                const std::complex<double> v = a[i + j + half] * w;
+                a[i + j] = u + v;
+                a[i + j + half] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+
+    if (inverse) {
+        const double inv_n = 1.0 / static_cast<double>(n);
+        for (auto& v : a) {
+            v *= inv_n;
+        }
+    }
+}
+
+void fft_2d(std::vector<std::complex<double>>& data, int nx, int ny, bool inverse) {
+    std::vector<std::complex<double>> line(static_cast<std::size_t>(std::max(nx, ny)));
+
+    for (int j = 0; j < ny; ++j) {
+        for (int i = 0; i < nx; ++i) {
+            line[i] = data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)];
+        }
+        line.resize(nx);
+        fft_1d(line, inverse);
+        for (int i = 0; i < nx; ++i) {
+            data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)] = line[i];
+        }
+    }
+
+    for (int i = 0; i < nx; ++i) {
+        for (int j = 0; j < ny; ++j) {
+            line[j] = data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)];
+        }
+        line.resize(ny);
+        fft_1d(line, inverse);
+        for (int j = 0; j < ny; ++j) {
+            data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)] = line[j];
+        }
+    }
+}
+
+Geometry make_geometry(int nx, int ny, double lx, double ly) {
+    IntVect dom_lo(AMREX_D_DECL(0, 0, 0));
+    IntVect dom_hi(AMREX_D_DECL(nx - 1, ny - 1, 0));
+    Box domain(dom_lo, dom_hi);
+    RealBox real_box({AMREX_D_DECL(0.0, 0.0, 0.0)}, {AMREX_D_DECL(lx, ly, 1.0)});
+    Array<int, AMREX_SPACEDIM> is_periodic{AMREX_D_DECL(1, 1, 0)};
+    return Geometry(domain, &real_box, CoordSys::cartesian, is_periodic.data());
+}
+
+BoxArray make_box_array(const Box& box) {
+    BoxArray ba(box);
+    ba.maxSize(std::clamp(std::min(box.length(0), box.length(1)), 32, 128));
+    return ba;
+}
+
+void reset_output_dir(const std::string& output_dir) {
+    if (ParallelDescriptor::IOProcessor()) {
+        std::error_code ec;
+        std::filesystem::remove_all(output_dir, ec);
+        ec.clear();
+        std::filesystem::create_directories(output_dir, ec);
         if (ec) {
             throw std::runtime_error("Failed to create output directory '" + output_dir + "': " + ec.message());
         }
     }
+    ParallelDescriptor::Barrier();
+}
 
-    MPI_Barrier(grid.cart_comm);
+std::string quote_shell_arg(const std::string& arg) {
+    std::string quoted;
+    quoted.reserve(arg.size() + 2);
+    quoted.push_back('"');
+    for (char c : arg) {
+        if (c == '"' || c == '\\' || c == '$' || c == '`') {
+            quoted.push_back('\\');
+        }
+        quoted.push_back(c);
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+std::vector<double> read_npy_2d(const std::string& path, int expected_ny, int expected_nx) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Failed to open numpy array file: " + path);
+    }
+
+    char magic[6];
+    in.read(magic, 6);
+    if (in.gcount() != 6 || std::string(magic, 6) != "\x93NUMPY") {
+        throw std::runtime_error("Unsupported .npy file header in " + path);
+    }
+
+    unsigned char major = 0;
+    unsigned char minor = 0;
+    in.read(reinterpret_cast<char*>(&major), 1);
+    in.read(reinterpret_cast<char*>(&minor), 1);
+    if (!in) {
+        throw std::runtime_error("Failed to read .npy version from " + path);
+    }
+
+    std::uint32_t header_len = 0;
+    if (major == 1) {
+        std::uint16_t len16 = 0;
+        in.read(reinterpret_cast<char*>(&len16), 2);
+        header_len = len16;
+    } else if (major == 2 || major == 3) {
+        in.read(reinterpret_cast<char*>(&header_len), 4);
+    } else {
+        throw std::runtime_error("Unsupported .npy version in " + path);
+    }
+
+    std::string header(header_len, '\0');
+    in.read(header.data(), static_cast<std::streamsize>(header.size()));
+    if (!in) {
+        throw std::runtime_error("Failed to read .npy header payload from " + path);
+    }
+
+    if (header.find("'fortran_order': True") != std::string::npos) {
+        throw std::runtime_error("Fortran-order .npy arrays are not supported: " + path);
+    }
+
+    std::smatch shape_match;
+    const std::regex shape_re(R"('shape':\s*\((\d+)\s*,\s*(\d+)\s*,?\))");
+    if (!std::regex_search(header, shape_match, shape_re)) {
+        throw std::runtime_error("Only 2D .npy arrays are supported: " + path);
+    }
+
+    const int ny = std::stoi(shape_match[1].str());
+    const int nx = std::stoi(shape_match[2].str());
+    if (ny != expected_ny || nx != expected_nx) {
+        throw std::runtime_error("Array shape mismatch in " + path + ": expected (" +
+                                 std::to_string(expected_ny) + ", " + std::to_string(expected_nx) +
+                                 "), got (" + std::to_string(ny) + ", " + std::to_string(nx) + ")");
+    }
+
+    const bool is_f8 = header.find("'descr': '<f8'") != std::string::npos ||
+                       header.find("\"descr\": \"<f8\"") != std::string::npos;
+    const bool is_f4 = header.find("'descr': '<f4'") != std::string::npos ||
+                       header.find("\"descr\": \"<f4\"") != std::string::npos;
+    if (!is_f8 && !is_f4) {
+        throw std::runtime_error("Only little-endian float32/float64 .npy arrays are supported: " + path);
+    }
+
+    std::vector<double> out(static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny));
+    if (is_f8) {
+        in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size() * sizeof(double)));
+    } else {
+        std::vector<float> tmp(out.size());
+        in.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(tmp.size() * sizeof(float)));
+        for (std::size_t i = 0; i < tmp.size(); ++i) {
+            out[i] = tmp[i];
+        }
+    }
+
+    if (!in) {
+        throw std::runtime_error("Failed to read array payload from " + path);
+    }
+
+    return out;
+}
+
+void ensure_finite(const char* label, const MultiFab& mf) {
+    if (mf.contains_nan()) {
+        throw std::runtime_error(std::string(label) + " contains NaN");
+    }
+}
+
+void ensure_finite_field(const char* label, const vecops::VectorField2D& field) {
+    ensure_finite((std::string(label) + ".x").c_str(), field.comp[vecops::X]);
+    ensure_finite((std::string(label) + ".y").c_str(), field.comp[vecops::Y]);
+    ensure_finite((std::string(label) + ".z").c_str(), field.comp[vecops::Z]);
 }
 
 } // namespace
 
-Simulation::Simulation(MPI_Comm world, const SimulationConfig& cfg)
-    : cfg_(cfg),
-      grid_(world, cfg.nx, cfg.ny, cfg.lx, cfg.ly, true, true, 1),
-      helmholtz_(cfg.helmholtz_max_iter, cfg.helmholtz_tol),
-      writer_(cfg.output_dir) {
-    b_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    q_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    u_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
+Simulation::Simulation(const SimulationConfig& cfg)
+    : cfg_(cfg) {
+    if (!is_power_of_two(cfg_.nx) || !is_power_of_two(cfg_.ny)) {
+        throw std::runtime_error("FFT Helmholtz inversion requires power-of-two nx and ny; got nx=" +
+                                 std::to_string(cfg_.nx) + ", ny=" + std::to_string(cfg_.ny));
+    }
 
-    rhs_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    rhs_stage_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    rhs_k3_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    rhs_k4_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    q_stage_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
-    b_stage_.resize(grid_.nx_local, grid_.ny_local, grid_.ng);
+    const Geometry geom = make_geometry(cfg_.nx, cfg_.ny, cfg_.lx, cfg_.ly);
+    define_level(geom, make_box_array(geom.Domain()));
+    initialize_state();
 
-    workspace_.resize(grid_);
+    if (!init_has_b_ && init_has_q_) {
+        solve_helmholtz();
+        compute_u_from_b(level_.b, level_.u);
+        fill_level_ghosts(level_.u);
+    } else if (init_has_b_ && !init_has_q_) {
+        compute_q_from_b(level_.b, level_.u, level_.q);
+    } else if (init_has_b_ && init_has_q_) {
+        compute_u_from_b(level_.b, level_.u);
+        fill_level_ghosts(level_.u);
+    } else {
+        throw std::runtime_error("Initialization did not provide either B or Q");
+    }
 
-    physics::initialize_magnetic_field(grid_, cfg_, b_);
-    physics::compute_q_from_b(grid_, b_, q_);
-    helmholtz_.solve(grid_, q_, b_);
-
-    if (grid_.rank == 0) {
-        std::cout << "Initialized simulation: nx=" << cfg_.nx << ", ny=" << cfg_.ny
-                  << ", dt=" << cfg_.dt << ", t_end=" << cfg_.t_end << "\n";
+    if (ParallelDescriptor::IOProcessor()) {
+        Print() << "Initialized staggered single-level AMReX solver with FFT Helmholtz inversion\n";
     }
 }
 
-void Simulation::write_output(int step, double time) {
-    VectorField2D b_work = b_;
-    grid_.exchange_halo(b_work);
-    vecops::compute_u_from_b(grid_, b_work, u_);
-    writer_.write_step(grid_, b_, u_, q_, step, time);
+void Simulation::define_level(const Geometry& geom, const BoxArray& ba) {
+    level_.geom = geom;
+    level_.ba = ba;
+    level_.dmap = DistributionMapping(ba);
+
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.b);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.q);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.u);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.rhs);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_b);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_q);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_u);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_cross);
+    vecops::define_field(level_.ba, level_.dmap, ng_, level_.work_divp);
+}
+
+void Simulation::initialize_state() {
+    init_has_b_ = false;
+    init_has_q_ = false;
+    init_b_ghosts_ready_ = false;
+
+    if (!cfg_.init_python_namelist.empty()) {
+        initialize_state_from_python_namelist();
+        return;
+    }
+
+    initialize_analytic_magnetic_field();
+    init_has_b_ = true;
+}
+
+void Simulation::initialize_analytic_magnetic_field() {
+    const Real two_pi = 2.0_rt * Math::pi<Real>();
+    const Real b0 = cfg_.init_b0;
+    const Real sigma = cfg_.init_sigma;
+    const Real psi0 = cfg_.init_perturbation;
+    const Real lx = cfg_.lx;
+    const Real ly = cfg_.ly;
+    const Real dx = level_.geom.CellSize(0);
+    const Real dy = level_.geom.CellSize(1);
+    const Real quarter_lx = Real(0.25) * lx;
+    const Real quarter_ly = Real(0.25) * ly;
+
+    for (MFIter mfi(level_.b.comp[vecops::X]); mfi.isValid(); ++mfi) {
+        const Box& box = mfi.validbox();
+        const auto bx = level_.b.comp[vecops::X].array(mfi);
+        const auto by = level_.b.comp[vecops::Y].array(mfi);
+        const auto bz = level_.b.comp[vecops::Z].array(mfi);
+        ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
+            const Real x_x = (i + Real(0.5)) * dx;
+            const Real y_x = j * dy;
+            const Real ph_x = (ly / (two_pi * sigma)) * std::cos(two_pi * y_x / ly);
+            const Real sin_mode_x = std::sin(4.0_rt * two_pi * (y_x - quarter_ly) / ly);
+
+            const Real x_y = i * dx;
+            const Real y_y = (j + Real(0.5)) * dy;
+            const Real cos_mode_y = std::cos(4.0_rt * two_pi * (y_y - quarter_ly) / ly);
+
+            const Real y_z = (j + Real(0.5)) * dy;
+            const Real ph_z = (ly / (two_pi * sigma)) * std::cos(two_pi * y_z / ly);
+
+            bx(i, j, 0) = b0 * std::tanh(ph_x)
+                         + 2.0_rt * (two_pi / ly) * psi0 *
+                           std::cos(two_pi * (x_x - quarter_lx) / lx) * sin_mode_x;
+            by(i, j, 0) = -psi0 * (two_pi / lx) *
+                           std::sin(two_pi * (x_y - quarter_lx) / lx) * cos_mode_y;
+            bz(i, j, 0) = b0 / std::cosh(ph_z);
+        });
+    }
+}
+
+void Simulation::initialize_state_from_python_namelist() {
+    std::filesystem::path helper_path;
+    for (const auto& candidate : {
+             std::filesystem::path("scripts/generate_init_from_python.py"),
+             std::filesystem::path(cfg_.config_dir) / ".." / "scripts" / "generate_init_from_python.py",
+             std::filesystem::path(cfg_.config_dir) / "scripts" / "generate_init_from_python.py"}) {
+        std::error_code ec;
+        const auto canonical = std::filesystem::weakly_canonical(candidate, ec);
+        if (!ec && std::filesystem::exists(canonical)) {
+            helper_path = canonical;
+            break;
+        }
+    }
+    if (helper_path.empty()) {
+        throw std::runtime_error("Missing Python initialization helper: scripts/generate_init_from_python.py");
+    }
+
+    const std::filesystem::path temp_root =
+        std::filesystem::temp_directory_path() /
+        ("qhd_init_" + std::to_string(ParallelDescriptor::NProcs()) + "_" +
+         std::to_string(static_cast<long long>(std::time(nullptr))));
+
+    if (ParallelDescriptor::IOProcessor()) {
+        std::error_code ec;
+        std::filesystem::remove_all(temp_root, ec);
+        ec.clear();
+        std::filesystem::create_directories(temp_root, ec);
+        if (ec) {
+            throw std::runtime_error("Failed to create temporary initialization directory '" +
+                                     temp_root.string() + "': " + ec.message());
+        }
+
+        std::ostringstream cmd;
+        const int active_nx = level_.geom.Domain().length(0);
+        const int active_ny = level_.geom.Domain().length(1);
+        cmd << "python3 "
+            << quote_shell_arg(helper_path.string())
+            << " --namelist " << quote_shell_arg(cfg_.init_python_namelist)
+            << " --nx " << active_nx
+            << " --ny " << active_ny
+            << " --lx " << std::setprecision(17) << cfg_.lx
+            << " --ly " << std::setprecision(17) << cfg_.ly
+            << " --staggered"
+            << " --output-dir " << quote_shell_arg(temp_root.string());
+
+        const int rc = std::system(cmd.str().c_str());
+        if (rc != 0) {
+            throw std::runtime_error("Python initialization failed for '" + cfg_.init_python_namelist +
+                                     "' with exit code " + std::to_string(rc));
+        }
+    }
+
+    ParallelDescriptor::Barrier();
+
+    const auto has_family = [&](const char* prefix) {
+        return std::filesystem::exists(temp_root / (std::string(prefix) + "x.npy")) &&
+               std::filesystem::exists(temp_root / (std::string(prefix) + "y.npy")) &&
+               std::filesystem::exists(temp_root / (std::string(prefix) + "z.npy"));
+    };
+
+    init_has_b_ = has_family("b");
+    init_has_q_ = has_family("q");
+    if (!init_has_b_ && !init_has_q_) {
+        throw std::runtime_error("Python namelist did not define a complete B or Q field family");
+    }
+
+    const int active_nx = level_.geom.Domain().length(0);
+    const int active_ny = level_.geom.Domain().length(1);
+    if (init_has_b_) {
+        load_array_into_multifab((temp_root / "bx.npy").string(), level_.b.comp[vecops::X], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "by.npy").string(), level_.b.comp[vecops::Y], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "bz.npy").string(), level_.b.comp[vecops::Z], active_ny, active_nx, 0, false);
+        if (!init_has_q_) {
+            load_array_into_multifab((temp_root / "bx.npy").string(), level_.work_b.comp[vecops::X], active_ny, active_nx, 0, true);
+            load_array_into_multifab((temp_root / "by.npy").string(), level_.work_b.comp[vecops::Y], active_ny, active_nx, 0, true);
+            load_array_into_multifab((temp_root / "bz.npy").string(), level_.work_b.comp[vecops::Z], active_ny, active_nx, 0, true);
+            init_b_ghosts_ready_ = true;
+        }
+    }
+    if (init_has_q_) {
+        load_array_into_multifab((temp_root / "qx.npy").string(), level_.q.comp[vecops::X], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "qy.npy").string(), level_.q.comp[vecops::Y], active_ny, active_nx, 0, false);
+        load_array_into_multifab((temp_root / "qz.npy").string(), level_.q.comp[vecops::Z], active_ny, active_nx, 0, false);
+    }
+
+    ParallelDescriptor::Barrier();
+    if (ParallelDescriptor::IOProcessor()) {
+        std::error_code ec;
+        std::filesystem::remove_all(temp_root, ec);
+    }
+    ParallelDescriptor::Barrier();
+}
+
+void Simulation::load_array_into_multifab(const std::string& path,
+                                          MultiFab& mf,
+                                          int expected_ny,
+                                          int expected_nx,
+                                          int component,
+                                          bool include_ghosts) const {
+    const auto data = read_npy_2d(path, expected_ny, expected_nx);
+    for (MFIter mfi(mf); mfi.isValid(); ++mfi) {
+        const Box& box = include_ghosts ? mfi.fabbox() : mfi.validbox();
+        const auto arr = mf.array(mfi);
+        const auto lo = amrex::lbound(box);
+        const auto hi = amrex::ubound(box);
+        for (int j = lo.y; j <= hi.y; ++j) {
+            for (int i = lo.x; i <= hi.x; ++i) {
+                const int ii = ((i % expected_nx) + expected_nx) % expected_nx;
+                const int jj = ((j % expected_ny) + expected_ny) % expected_ny;
+                arr(i, j, component) = data[static_cast<std::size_t>(jj) * expected_nx + ii];
+            }
+        }
+    }
+}
+
+void Simulation::fill_level_ghosts(VectorField& field) {
+    vecops::fill_periodic(level_.geom, field);
+}
+
+void Simulation::compute_u_from_b(const VectorField& b, VectorField& u) {
+    vecops::copy(b, level_.work_b);
+    fill_level_ghosts(level_.work_b);
+    vecops::compute_u_from_b_filled(level_.geom, level_.work_b, u);
+}
+
+void Simulation::compute_q_from_b(const VectorField& b, VectorField& u, VectorField& q) {
+    if (init_b_ghosts_ready_) {
+        vecops::compute_u_from_b_filled(level_.geom, level_.work_b, u);
+        vecops::compute_q_from_b_filled(level_.geom, level_.work_b, q);
+        init_b_ghosts_ready_ = false;
+        return;
+    }
+
+    vecops::copy(b, level_.work_b);
+    fill_level_ghosts(level_.work_b);
+    vecops::compute_u_from_b_filled(level_.geom, level_.work_b, u);
+    fill_level_ghosts(u);
+    vecops::compute_q_from_b_filled(level_.geom, level_.work_b, q);
+}
+
+void Simulation::compute_div_pressure_from_filled(const VectorField& u, VectorField& divp) {
+    if (cfg_.nu == Real(0.0)) {
+        vecops::set_val(divp, 0.0);
+        return;
+    }
+
+    const Real idx = Real(1.0) / level_.geom.CellSize(0);
+    const Real idy = Real(1.0) / level_.geom.CellSize(1);
+    const Real idx2 = idx * idx;
+    const Real idy2 = idy * idy;
+    const Real idx_idy = idx * idy;
+    const Real nu = cfg_.nu;
+
+    for (MFIter mfi(divp.comp[vecops::X]); mfi.isValid(); ++mfi) {
+        const Box& box = mfi.validbox();
+        const auto ux = u.comp[vecops::X].const_array(mfi);
+        const auto uy = u.comp[vecops::Y].const_array(mfi);
+        const auto uz = u.comp[vecops::Z].const_array(mfi);
+        const auto divpx = divp.comp[vecops::X].array(mfi);
+        const auto divpy = divp.comp[vecops::Y].array(mfi);
+        const auto divpz = divp.comp[vecops::Z].array(mfi);
+        ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
+            const Real dxx_ux = (ux(i + 1, j, 0) - 2.0_rt * ux(i, j, 0) + ux(i - 1, j, 0)) * idx2;
+            const Real dyy_ux = (ux(i, j + 1, 0) - 2.0_rt * ux(i, j, 0) + ux(i, j - 1, 0)) * idy2;
+            const Real dy_dx_uy =
+                (uy(i + 1, j, 0) - uy(i, j, 0) - uy(i + 1, j - 1, 0) + uy(i, j - 1, 0)) * idx_idy;
+
+            const Real dxx_uy = (uy(i + 1, j, 0) - 2.0_rt * uy(i, j, 0) + uy(i - 1, j, 0)) * idx2;
+            const Real dyy_uy = (uy(i, j + 1, 0) - 2.0_rt * uy(i, j, 0) + uy(i, j - 1, 0)) * idy2;
+            const Real dx_dy_ux =
+                (ux(i, j + 1, 0) - ux(i, j, 0) - ux(i - 1, j + 1, 0) + ux(i - 1, j, 0)) * idx_idy;
+
+            const Real dxx_uz = (uz(i + 1, j, 0) - 2.0_rt * uz(i, j, 0) + uz(i - 1, j, 0)) * idx2;
+            const Real dyy_uz = (uz(i, j + 1, 0) - 2.0_rt * uz(i, j, 0) + uz(i, j - 1, 0)) * idy2;
+
+            // Default symmetric closure: P = -nu * (grad(u) + grad(u)^T), with Pzz = 0.
+            divpx(i, j, 0) = -nu * (2.0_rt * dxx_ux + dyy_ux + dy_dx_uy);
+            divpy(i, j, 0) = -nu * (dxx_uy + 2.0_rt * dyy_uy + dx_dy_ux);
+            divpz(i, j, 0) = -nu * (dxx_uz + dyy_uz);
+        });
+    }
+}
+
+void Simulation::compute_rhs(const VectorField& b,
+                             const VectorField& q,
+                             VectorField& rhs) {
+    vecops::copy(b, level_.work_b);
+    vecops::copy(q, level_.work_q);
+    fill_level_ghosts(level_.work_b);
+    fill_level_ghosts(level_.work_q);
+
+    vecops::compute_u_from_b_filled(level_.geom, level_.work_b, level_.work_u);
+    fill_level_ghosts(level_.work_u);
+    vecops::compute_cross_product(level_.work_u, level_.work_q, level_.work_cross);
+    compute_div_pressure_from_filled(level_.work_u, level_.work_divp);
+    vecops::saxpy(level_.work_cross, -1.0, level_.work_divp);
+    fill_level_ghosts(level_.work_cross);
+    vecops::compute_curl_from_filled(level_.geom, level_.work_cross, rhs);
+
+    if (cfg_.eta != Real(0.0)) {
+        for (int n = 0; n < 3; ++n) {
+            for (MFIter mfi(rhs.comp[n]); mfi.isValid(); ++mfi) {
+                const Box& box = mfi.validbox();
+                const auto out = rhs.comp[n].array(mfi);
+                const auto qarr = level_.work_q.comp[n].const_array(mfi);
+                const auto barr = level_.work_b.comp[n].const_array(mfi);
+                const Real eta = cfg_.eta;
+                ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
+                    out(i, j, 0) -= eta * (qarr(i, j, 0) + barr(i, j, 0));
+                });
+            }
+        }
+    }
+
+    ensure_finite_field("RHS", rhs);
+}
+
+void Simulation::solve_helmholtz() {
+    const int nx = level_.geom.Domain().length(0);
+    const int ny = level_.geom.Domain().length(1);
+    const Box domain = level_.geom.Domain();
+    BoxArray spectral_ba(domain);
+    DistributionMapping spectral_dmap(Vector<int>{ParallelDescriptor::IOProcessorNumber()});
+    MultiFab spectral_field(spectral_ba, spectral_dmap, 1, 0);
+    std::vector<std::complex<double>> spectrum(static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny));
+    const double idx2 = 1.0 / (level_.geom.CellSize(0) * level_.geom.CellSize(0));
+    const double idy2 = 1.0 / (level_.geom.CellSize(1) * level_.geom.CellSize(1));
+
+    for (int comp = 0; comp < 3; ++comp) {
+        MultiFab& bcomp = level_.b.comp[comp];
+        const MultiFab& qcomp = level_.q.comp[comp];
+        ensure_finite("Helmholtz q", qcomp);
+
+        spectral_field.setVal(0.0);
+        spectral_field.ParallelCopy(qcomp, 0, 0, 1);
+
+        if (ParallelDescriptor::IOProcessor()) {
+            for (MFIter mfi(spectral_field); mfi.isValid(); ++mfi) {
+                const auto arr = spectral_field.array(mfi);
+                for (int j = domain.smallEnd(1); j <= domain.bigEnd(1); ++j) {
+                    for (int i = domain.smallEnd(0); i <= domain.bigEnd(0); ++i) {
+                        const std::size_t idx =
+                            static_cast<std::size_t>(i - domain.smallEnd(0)) +
+                            static_cast<std::size_t>(nx) * static_cast<std::size_t>(j - domain.smallEnd(1));
+                        spectrum[idx] = std::complex<double>(arr(i, j, 0), 0.0);
+                    }
+                }
+            }
+
+            fft_2d(spectrum, nx, ny, false);
+
+            for (int ky = 0; ky < ny; ++ky) {
+                const double theta_y = 2.0 * PI * static_cast<double>(ky) / static_cast<double>(ny);
+                const double lambda_y = 2.0 * (std::cos(theta_y) - 1.0) * idy2;
+
+                for (int kx = 0; kx < nx; ++kx) {
+                    const double theta_x = 2.0 * PI * static_cast<double>(kx) / static_cast<double>(nx);
+                    const double lambda_x = 2.0 * (std::cos(theta_x) - 1.0) * idx2;
+                    const double denom = (lambda_x + lambda_y) - 1.0;
+                    const std::size_t idx =
+                        static_cast<std::size_t>(kx) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(ky);
+                    spectrum[idx] /= denom;
+                }
+            }
+
+            fft_2d(spectrum, nx, ny, true);
+
+            for (MFIter mfi(spectral_field); mfi.isValid(); ++mfi) {
+                const auto arr = spectral_field.array(mfi);
+                for (int j = domain.smallEnd(1); j <= domain.bigEnd(1); ++j) {
+                    for (int i = domain.smallEnd(0); i <= domain.bigEnd(0); ++i) {
+                        const std::size_t idx =
+                            static_cast<std::size_t>(i - domain.smallEnd(0)) +
+                            static_cast<std::size_t>(nx) * static_cast<std::size_t>(j - domain.smallEnd(1));
+                        arr(i, j, 0) = spectrum[idx].real();
+                    }
+                }
+            }
+        }
+
+        bcomp.ParallelCopy(spectral_field, 0, 0, 1);
+        ensure_finite("Helmholtz b", bcomp);
+    }
+}
+
+void Simulation::write_output(int step, Real time) {
+    Vector<std::string> names = {"Bx", "By", "Bz", "Ux", "Uy", "Uz", "Qx", "Qy", "Qz"};
+
+    fill_level_ghosts(level_.b);
+    fill_level_ghosts(level_.u);
+    fill_level_ghosts(level_.q);
+
+    MultiFab plot_data(level_.ba, level_.dmap, 9, 0);
+    for (MFIter mfi(plot_data); mfi.isValid(); ++mfi) {
+        const Box& box = mfi.validbox();
+        const auto bx = level_.b.comp[vecops::X].const_array(mfi);
+        const auto by = level_.b.comp[vecops::Y].const_array(mfi);
+        const auto bz = level_.b.comp[vecops::Z].const_array(mfi);
+        const auto ux = level_.u.comp[vecops::X].const_array(mfi);
+        const auto uy = level_.u.comp[vecops::Y].const_array(mfi);
+        const auto uz = level_.u.comp[vecops::Z].const_array(mfi);
+        const auto qx = level_.q.comp[vecops::X].const_array(mfi);
+        const auto qy = level_.q.comp[vecops::Y].const_array(mfi);
+        const auto qz = level_.q.comp[vecops::Z].const_array(mfi);
+        const auto out = plot_data.array(mfi);
+        ParallelFor(box, [=] AMREX_GPU_DEVICE(int i, int j, int) noexcept {
+            out(i, j, 0) = 0.5_rt * (bx(i, j, 0) + bx(i, j + 1, 0));
+            out(i, j, 1) = 0.5_rt * (by(i, j, 0) + by(i + 1, j, 0));
+            out(i, j, 2) = bz(i, j, 0);
+
+            out(i, j, 3) = 0.5_rt * (ux(i, j, 0) + ux(i, j + 1, 0));
+            out(i, j, 4) = 0.5_rt * (uy(i, j, 0) + uy(i + 1, j, 0));
+            out(i, j, 5) = uz(i, j, 0);
+
+            out(i, j, 6) = 0.5_rt * (qx(i, j, 0) + qx(i, j + 1, 0));
+            out(i, j, 7) = 0.5_rt * (qy(i, j, 0) + qy(i + 1, j, 0));
+            out(i, j, 8) = qz(i, j, 0);
+        });
+    }
+
+    std::ostringstream oss;
+    oss << cfg_.output_dir << "/plt_" << std::setw(6) << std::setfill('0') << step;
+    WriteSingleLevelPlotfile(oss.str(), plot_data, names, level_.geom, time, step);
 }
 
 void Simulation::run() {
-    double time = 0.0;
+    Real time = 0.0;
     int step = 0;
+    Real rhs_wall_total = 0.0;
+    Real helmholtz_wall_total = 0.0;
+    Real velocity_wall_total = 0.0;
 
-    const double run_start_wall = MPI_Wtime();
-
-    reset_output_dir(grid_, cfg_.output_dir);
+    reset_output_dir(cfg_.output_dir);
     write_output(step, time);
-    double interval_start_wall = MPI_Wtime();
-    int interval_start_step = step;
 
-    while (time < cfg_.t_end - 1.0e-14) {
-        const double dt = std::min(cfg_.dt, cfg_.t_end - time);
-        const double dt_half = 0.5 * dt;
-        const double dt_sixth = dt / 6.0;
+    const Real start_wall = ParallelDescriptor::second();
+    while (time < cfg_.t_end - Real(1.0e-14)) {
+        const Real dt = std::min(cfg_.dt, cfg_.t_end - time);
 
-        // k1 = f(q_n)
-        physics::compute_rhs(grid_, b_, q_, cfg_.nu, cfg_.eta, workspace_, rhs_);
+        const Real rhs_wall_start = ParallelDescriptor::second();
+        compute_rhs(level_.b, level_.q, level_.rhs);
+        rhs_wall_total += ParallelDescriptor::second() - rhs_wall_start;
+        vecops::saxpy(level_.q, dt, level_.rhs);
 
-        // k2 = f(q_n + dt/2 * k1)
-#pragma omp parallel for collapse(2)
-        for (int j = grid_.ng; j < grid_.ng + grid_.ny_local; ++j) {
-            for (int i = grid_.ng; i < grid_.ng + grid_.nx_local; ++i) {
-                const int c = grid_.idx(i, j);
-                q_stage_.x[c] = q_.x[c] + dt_half * rhs_.x[c];
-                q_stage_.y[c] = q_.y[c] + dt_half * rhs_.y[c];
-                q_stage_.z[c] = q_.z[c] + dt_half * rhs_.z[c];
-            }
-        }
-        b_stage_ = b_;
-        helmholtz_.solve(grid_, q_stage_, b_stage_);
-        physics::compute_rhs(grid_, b_stage_, q_stage_, cfg_.nu, cfg_.eta, workspace_, rhs_stage_);
+        const Real helmholtz_wall_start = ParallelDescriptor::second();
+        solve_helmholtz();
+        helmholtz_wall_total += ParallelDescriptor::second() - helmholtz_wall_start;
 
-        // k3 = f(q_n + dt/2 * k2)
-#pragma omp parallel for collapse(2)
-        for (int j = grid_.ng; j < grid_.ng + grid_.ny_local; ++j) {
-            for (int i = grid_.ng; i < grid_.ng + grid_.nx_local; ++i) {
-                const int c = grid_.idx(i, j);
-                q_stage_.x[c] = q_.x[c] + dt_half * rhs_stage_.x[c];
-                q_stage_.y[c] = q_.y[c] + dt_half * rhs_stage_.y[c];
-                q_stage_.z[c] = q_.z[c] + dt_half * rhs_stage_.z[c];
-            }
-        }
-        b_stage_ = b_;
-        helmholtz_.solve(grid_, q_stage_, b_stage_);
-        physics::compute_rhs(grid_, b_stage_, q_stage_, cfg_.nu, cfg_.eta, workspace_, rhs_k3_);
-
-        // k4 = f(q_n + dt * k3)
-#pragma omp parallel for collapse(2)
-        for (int j = grid_.ng; j < grid_.ng + grid_.ny_local; ++j) {
-            for (int i = grid_.ng; i < grid_.ng + grid_.nx_local; ++i) {
-                const int c = grid_.idx(i, j);
-                q_stage_.x[c] = q_.x[c] + dt * rhs_k3_.x[c];
-                q_stage_.y[c] = q_.y[c] + dt * rhs_k3_.y[c];
-                q_stage_.z[c] = q_.z[c] + dt * rhs_k3_.z[c];
-            }
-        }
-        b_stage_ = b_;
-        helmholtz_.solve(grid_, q_stage_, b_stage_);
-        physics::compute_rhs(grid_, b_stage_, q_stage_, cfg_.nu, cfg_.eta, workspace_, rhs_k4_);
-
-        // q_{n+1} = q_n + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-#pragma omp parallel for collapse(2)
-        for (int j = grid_.ng; j < grid_.ng + grid_.ny_local; ++j) {
-            for (int i = grid_.ng; i < grid_.ng + grid_.nx_local; ++i) {
-                const int c = grid_.idx(i, j);
-                q_.x[c] += dt_sixth * (rhs_.x[c] + 2.0 * rhs_stage_.x[c] + 2.0 * rhs_k3_.x[c] + rhs_k4_.x[c]);
-                q_.y[c] += dt_sixth * (rhs_.y[c] + 2.0 * rhs_stage_.y[c] + 2.0 * rhs_k3_.y[c] + rhs_k4_.y[c]);
-                q_.z[c] += dt_sixth * (rhs_.z[c] + 2.0 * rhs_stage_.z[c] + 2.0 * rhs_k3_.z[c] + rhs_k4_.z[c]);
-            }
-        }
-
-        helmholtz_.solve(grid_, q_, b_);
+        const Real velocity_wall_start = ParallelDescriptor::second();
+        compute_u_from_b(level_.b, level_.u);
+        fill_level_ghosts(level_.u);
+        velocity_wall_total += ParallelDescriptor::second() - velocity_wall_start;
 
         time += dt;
         ++step;
 
-        if (step % cfg_.output_every == 0 || time >= cfg_.t_end - 1.0e-14) {
+        if (step % cfg_.output_every == 0 || time >= cfg_.t_end - Real(1.0e-14)) {
             write_output(step, time);
-
-            const double now_wall = MPI_Wtime();
-            const double interval_local = now_wall - interval_start_wall;
-            const double elapsed_local = now_wall - run_start_wall;
-
-            double interval_wall = 0.0;
-            double elapsed_wall = 0.0;
-            MPI_Reduce(&interval_local, &interval_wall, 1, MPI_DOUBLE, MPI_MAX, 0, grid_.cart_comm);
-            MPI_Reduce(&elapsed_local, &elapsed_wall, 1, MPI_DOUBLE, MPI_MAX, 0, grid_.cart_comm);
-
-            const int interval_steps = step - interval_start_step;
-
-            if (grid_.rank == 0) {
-                std::ostringstream oss;
-                oss << std::fixed << std::setprecision(3);
-                oss << "[timing] step=" << step << " time=" << time;
-                oss << " interval_steps=" << interval_steps << " interval_wall=" << interval_wall << " s";
-                if (interval_steps > 0) {
-                    oss << " (" << (interval_wall / static_cast<double>(interval_steps)) << " s/step)";
-                }
-                oss << " elapsed=" << elapsed_wall << " s";
-
-                const double progress = std::clamp(time / cfg_.t_end, 0.0, 1.0);
-                if (progress > 1.0e-12) {
-                    const double est_total = elapsed_wall / progress;
-                    const double eta = std::max(0.0, est_total - elapsed_wall);
-                    oss << " est_total=" << est_total << " s";
-                    oss << " eta=" << eta << " s";
-                }
-
-                std::cout << oss.str() << '\n';
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << std::fixed << std::setprecision(6)
+                        << "step=" << step
+                        << " time=" << time
+                        << " dt=" << dt
+                        << " wall=" << (ParallelDescriptor::second() - start_wall) << " s\n";
             }
-
-            interval_start_wall = now_wall;
-            interval_start_step = step;
-        }
-
-        if (grid_.rank == 0 && step % 20 == 0) {
-            std::cout << "step=" << step << ", time=" << time << '\n';
         }
     }
 
-    const double final_elapsed_local = MPI_Wtime() - run_start_wall;
-    double final_elapsed_wall = 0.0;
-    MPI_Reduce(&final_elapsed_local, &final_elapsed_wall, 1, MPI_DOUBLE, MPI_MAX, 0, grid_.cart_comm);
-
-    if (grid_.rank == 0) {
-        std::cout << "Simulation finished at t=" << time << " after " << step
-                  << " steps. Total wall time=" << std::fixed << std::setprecision(3)
-                  << final_elapsed_wall << " s.\n";
+    if (ParallelDescriptor::IOProcessor()) {
+        const Real total_wall = ParallelDescriptor::second() - start_wall;
+        const Real accounted_wall = rhs_wall_total + helmholtz_wall_total + velocity_wall_total;
+        Print() << std::fixed << std::setprecision(6)
+                << "[timing] rhs=" << rhs_wall_total << " s"
+                << " (" << (100.0_rt * rhs_wall_total / std::max(total_wall, Real(1.0e-14))) << "%)"
+                << " helmholtz=" << helmholtz_wall_total << " s"
+                << " (" << (100.0_rt * helmholtz_wall_total / std::max(total_wall, Real(1.0e-14))) << "%)"
+                << " velocity=" << velocity_wall_total << " s"
+                << " (" << (100.0_rt * velocity_wall_total / std::max(total_wall, Real(1.0e-14))) << "%)"
+                << " accounted=" << accounted_wall << " s"
+                << " total=" << total_wall << " s\n";
     }
 }

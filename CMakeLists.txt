@@ -5,36 +5,24 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(MPI REQUIRED)
-find_package(OpenMP REQUIRED)
-find_package(HDF5 REQUIRED COMPONENTS C)
+set(AMReX_SPACEDIM 2 CACHE STRING "")
+set(AMReX_MPI YES CACHE BOOL "")
+set(AMReX_OMP YES CACHE BOOL "")
+set(AMReX_GPU_BACKEND NONE CACHE STRING "")
+set(AMReX_PLOTFILE_TOOLS NO CACHE BOOL "")
+set(AMReX_FORTRAN NO CACHE BOOL "")
 
-set(SOURCES
+add_subdirectory(external/amrex)
+
+add_executable(qhd_emhd
     src/main.cpp
     src/Config.cpp
-    src/Grid2D.cpp
-    src/Field.cpp
     src/VectorOps.cpp
-    src/Physics.cpp
-    src/HelmholtzSolver.cpp
-    src/HDF5Writer.cpp
     src/Simulation.cpp
 )
 
-add_executable(qhd_emhd ${SOURCES})
-
-target_include_directories(qhd_emhd
-    PRIVATE
-        include
-        ${HDF5_INCLUDE_DIRS}
-)
-
-target_link_libraries(qhd_emhd
-    PRIVATE
-        MPI::MPI_CXX
-        OpenMP::OpenMP_CXX
-        ${HDF5_LIBRARIES}
-)
+target_include_directories(qhd_emhd PRIVATE include)
+target_link_libraries(qhd_emhd PRIVATE AMReX::amrex)
 
 if (MSVC)
     target_compile_options(qhd_emhd PRIVATE /W4)

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Interactive viewer: z-component colormap + in-plane flux contours."""
+"""Interactive viewer for AMReX plotfiles with grid-layout panel."""
 
 from __future__ import annotations
 
 import argparse
 import pathlib
+import runpy
 import sys
 from functools import lru_cache
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from matplotlib.widgets import Slider
 import numpy as np
 
-from read_output import discover_steps, files_for_step, read_global_field
+from read_output import discover_steps, plotfile_for_step, read_global_field, read_grid_layout
 
 VECTOR_FIELDS = {
     "Q": ("Qx", "Qy", "Qz"),
@@ -23,7 +25,9 @@ VECTOR_FIELDS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", default="output", help="Directory with step_XXXXXX_rank_YYYY.h5 files")
+    parser.add_argument("--output-dir", default="output", help="Directory with AMReX plotfiles `plt_XXXXXX`")
+    parser.add_argument("--config", default=None, help="Simulation config used for the run; supplies `nu` for tr(P)")
+    parser.add_argument("--nu", type=float, default=None, help="Manual viscosity override for the tr(P) panel")
     parser.add_argument("--start-step", type=int, default=None, help="Initial step (default: latest)")
     parser.add_argument("--levels", type=int, default=16, help="Number of contour levels per subplot")
     parser.add_argument("--cmap", default="RdBu_r", help="Matplotlib colormap for z-component background")
@@ -69,22 +73,21 @@ def inplane_flux_function(fx: np.ndarray, fy: np.ndarray, dx: float, dy: float) 
 @lru_cache(maxsize=8)
 def load_step(output_dir_str: str, step: int) -> tuple[dict[str, np.ndarray], dict]:
     output_dir = pathlib.Path(output_dir_str)
-    step_files = files_for_step(output_dir, step)
-    if not step_files:
-        raise RuntimeError(f"No files found for step {step}")
+    plotfile_dir = plotfile_for_step(output_dir, step)
+    if not plotfile_dir.exists():
+        raise RuntimeError(f"No plotfile found for step {step}")
 
     arrays: dict[str, np.ndarray] = {}
-    meta = None
+    meta = read_grid_layout(plotfile_dir)
 
     for field_x, field_y, field_z in VECTOR_FIELDS.values():
-        arr_x, meta_x = read_global_field(step_files, field_x)
-        arr_y, meta_y = read_global_field(step_files, field_y)
-        arr_z, meta_z = read_global_field(step_files, field_z)
+        arr_x, meta_x = read_global_field(plotfile_dir, field_x)
+        arr_y, meta_y = read_global_field(plotfile_dir, field_y)
+        arr_z, meta_z = read_global_field(plotfile_dir, field_z)
         arrays[field_x] = arr_x
         arrays[field_y] = arr_y
         arrays[field_z] = arr_z
-        if meta is None:
-            meta = meta_x
+        meta["time"] = meta_x["time"]
         if (
             meta_x["global_nx"] != meta_y["global_nx"]
             or meta_x["global_ny"] != meta_y["global_ny"]
@@ -93,8 +96,101 @@ def load_step(output_dir_str: str, step: int) -> tuple[dict[str, np.ndarray], di
         ):
             raise RuntimeError("Inconsistent metadata between vector components")
 
-    assert meta is not None
     return arrays, meta
+
+
+def parse_cfg_file(path: pathlib.Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def load_config_values(config_path: pathlib.Path) -> dict[str, object]:
+    if config_path.suffix == ".py":
+        namespace = {
+            "__file__": str(config_path),
+            "np": np,
+        }
+        user_ns = runpy.run_path(str(config_path), init_globals=namespace)
+        values: dict[str, object] = {}
+        if "nu" in user_ns:
+            values["nu"] = float(user_ns["nu"])
+        if "output_dir" in user_ns:
+            values["output_dir"] = str(user_ns["output_dir"])
+        return values
+
+    if config_path.suffix == ".cfg":
+        raw_values = parse_cfg_file(config_path)
+        values = {}
+        if "nu" in raw_values:
+            values["nu"] = float(strip_quotes(raw_values["nu"]))
+        if "output_dir" in raw_values:
+            values["output_dir"] = strip_quotes(raw_values["output_dir"])
+        return values
+
+    raise RuntimeError(f"Unsupported config format: {config_path}")
+
+
+def resolve_output_dir(path_str: str) -> pathlib.Path:
+    path = pathlib.Path(path_str)
+    if path.is_absolute():
+        return path.resolve()
+    return (pathlib.Path.cwd() / path).resolve()
+
+
+def resolve_viscosity(output_dir: pathlib.Path, config_path_str: str | None, nu_override: float | None) -> float:
+    if nu_override is not None:
+        return float(nu_override)
+
+    if config_path_str is not None:
+        config_path = pathlib.Path(config_path_str).resolve()
+        values = load_config_values(config_path)
+        if "nu" not in values:
+            raise RuntimeError(f"Config does not define `nu`: {config_path}")
+        return float(values["nu"])
+
+    config_dir = pathlib.Path("config")
+    matches: list[tuple[pathlib.Path, float]] = []
+    if config_dir.exists():
+        for pattern in ("*.py", "*.cfg"):
+            for candidate in sorted(config_dir.glob(pattern)):
+                try:
+                    values = load_config_values(candidate)
+                except Exception:
+                    continue
+                if "nu" not in values or "output_dir" not in values:
+                    continue
+                if resolve_output_dir(str(values["output_dir"])) == output_dir.resolve():
+                    matches.append((candidate.resolve(), float(values["nu"])))
+
+    if len(matches) == 1:
+        return matches[0][1]
+
+    if len(matches) > 1:
+        py_matches = [(path, nu) for path, nu in matches if path.suffix == ".py"]
+        if len(py_matches) == 1:
+            py_stem = py_matches[0][0].stem
+            sibling_cfgs = [path for path, _ in matches if path.suffix == ".cfg" and path.stem == py_stem]
+            if len(py_matches) + len(sibling_cfgs) == len(matches):
+                return py_matches[0][1]
+        unique_nu = {nu for _, nu in matches}
+        if len(unique_nu) == 1:
+            return unique_nu.pop()
+        match_list = ", ".join(str(path) for path, _ in matches)
+        raise RuntimeError(f"Multiple configs match output dir {output_dir}: {match_list}. Use --config or --nu.")
+
+    raise RuntimeError(f"Could not determine `nu` for tr(P) from {output_dir}. Use --config or --nu.")
 
 
 def compute_fluxes(arrays: dict[str, np.ndarray], meta: dict) -> dict[str, np.ndarray]:
@@ -104,6 +200,109 @@ def compute_fluxes(arrays: dict[str, np.ndarray], meta: dict) -> dict[str, np.nd
     for name, (field_x, field_y, _) in VECTOR_FIELDS.items():
         fluxes[name] = inplane_flux_function(arrays[field_x], arrays[field_y], dx, dy)
     return fluxes
+
+
+def pressure_trace(arrays: dict[str, np.ndarray], meta: dict, nu: float | None = None) -> np.ndarray:
+    if nu is None:
+        nu = float(meta.get("nu", 0.0))
+
+    dx = float(meta["dx"])
+    dy = float(meta["dy"])
+    ux = arrays["Ux"]
+    uy = arrays["Uy"]
+
+    dux_dx = (np.roll(ux, -1, axis=1) - np.roll(ux, 1, axis=1)) / (2.0 * dx)
+    duy_dy = (np.roll(uy, -1, axis=0) - np.roll(uy, 1, axis=0)) / (2.0 * dy)
+
+    # Match the solver's default symmetric closure:
+    # P = -nu * (grad(u) + grad(u)^T), with Pzz = 0 in 2D.
+    return -2.0 * nu * (dux_dx + duy_dy)
+
+
+def cell_center_axes(meta: dict) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
+    nx = int(meta["global_nx"])
+    ny = int(meta["global_ny"])
+    dx = float(meta["dx"])
+    dy = float(meta["dy"])
+    prob_lo_x = float(meta["prob_lo"][0])
+    prob_lo_y = float(meta["prob_lo"][1])
+    prob_hi_x = float(meta["prob_hi"][0])
+    prob_hi_y = float(meta["prob_hi"][1])
+    x = prob_lo_x + (np.arange(nx) + 0.5) * dx
+    y = prob_lo_y + (np.arange(ny) + 0.5) * dy
+    extent = (prob_lo_x, prob_hi_x, prob_lo_y, prob_hi_y)
+    return x, y, extent
+
+
+def draw_grid_layout(
+    ax: plt.Axes,
+    meta: dict,
+    trace_p: np.ndarray,
+    cmap: str,
+    vmin: float | None = None,
+    vmax: float | None = None,
+):
+    prob_lo_x, prob_lo_y = float(meta["prob_lo"][0]), float(meta["prob_lo"][1])
+    prob_hi_x, prob_hi_y = float(meta["prob_hi"][0]), float(meta["prob_hi"][1])
+    domain_width = prob_hi_x - prob_lo_x
+    domain_height = prob_hi_y - prob_lo_y
+    nx = int(meta["global_nx"])
+    ny = int(meta["global_ny"])
+
+    ax.clear()
+    image = ax.imshow(
+        trace_p,
+        origin="lower",
+        cmap=cmap,
+        interpolation="nearest",
+        extent=(prob_lo_x, prob_hi_x, prob_lo_y, prob_hi_y),
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.add_patch(
+        Rectangle(
+            (prob_lo_x, prob_lo_y),
+            domain_width,
+            domain_height,
+            fill=False,
+            edgecolor="black",
+            linewidth=1.4,
+        )
+    )
+
+    level_colors = ["#4C78A8", "#E45756", "#54A24B", "#B279A2"]
+    for level in meta["levels"]:
+        color = level_colors[level["level"] % len(level_colors)]
+        for box in level["boxes"]:
+            x0 = prob_lo_x + domain_width * (box["lo_x"] / nx)
+            y0 = prob_lo_y + domain_height * (box["lo_y"] / ny)
+            width = domain_width * ((box["hi_x"] - box["lo_x"]) / nx)
+            height = domain_height * ((box["hi_y"] - box["lo_y"]) / ny)
+            ax.add_patch(
+                Rectangle(
+                    (x0, y0),
+                    width,
+                    height,
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=1.2 if level["level"] > 0 else 1.0,
+                )
+            )
+
+    ax.set_title("tr(P) with current grid layout")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_xlim(prob_lo_x, prob_hi_x)
+    ax.set_ylim(prob_lo_y, prob_hi_y)
+    ax.set_aspect("equal")
+    ax.grid(False)
+
+    legend_lines = [
+        plt.Line2D([0], [0], color=level_colors[level["level"] % len(level_colors)], lw=1.5, label=f"Level {level['level']}")
+        for level in meta["levels"]
+    ]
+    ax.legend(handles=legend_lines, loc="upper right", frameon=True, fontsize=8)
+    return image
 
 
 def main() -> int:
@@ -116,7 +315,13 @@ def main() -> int:
 
     steps = discover_steps(output_dir)
     if not steps:
-        print(f"No step files found in {output_dir}", file=sys.stderr)
+        print(f"No plotfiles found in {output_dir}", file=sys.stderr)
+        return 1
+
+    try:
+        nu = resolve_viscosity(output_dir, args.config, args.nu)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     if args.start_step is None:
@@ -130,19 +335,20 @@ def main() -> int:
     first_step = steps[step_idx]
     arrays, meta = load_step(str(output_dir), first_step)
     fluxes = compute_fluxes(arrays, meta)
+    trace_p = pressure_trace(arrays, meta, nu)
+    x, y, extent = cell_center_axes(meta)
 
-    ny, nx = next(iter(fluxes.values())).shape
-    x = (np.arange(nx) + 0.5) * float(meta["dx"])
-    y = (np.arange(ny) + 0.5) * float(meta["dy"])
-
-    fig, axes = plt.subplots(3, 1, figsize=(6.8, 13.2))
-    fig.subplots_adjust(left=0.1, right=0.93, top=0.94, bottom=0.14, hspace=0.28)
+    fig, axes = plt.subplots(2, 2, figsize=(12.6, 10.2))
+    fig.subplots_adjust(left=0.08, right=0.95, top=0.93, bottom=0.14, hspace=0.3, wspace=0.28)
+    field_axes = [axes[0, 0], axes[0, 1], axes[1, 0]]
+    grid_ax = axes[1, 1]
 
     images = {}
     colorbars = {}
     contour_limits = {}
     z_limits = {}
-    for ax, name in zip(axes, ["Q", "B", "u"]):
+    trace_limits = safe_limits(trace_p)
+    for ax, name in zip(field_axes, ["Q", "B", "u"]):
         field_z = VECTOR_FIELDS[name][2]
         z = arrays[field_z]
         psi = fluxes[name]
@@ -156,7 +362,7 @@ def main() -> int:
             origin="lower",
             cmap=args.cmap,
             interpolation="nearest",
-            extent=(x[0], x[-1], y[0], y[-1]),
+            extent=extent,
             vmin=z_vmin,
             vmax=z_vmax,
         )
@@ -171,16 +377,30 @@ def main() -> int:
         images[name] = image
         colorbars[name] = cbar
 
+    images["trace_p"] = draw_grid_layout(
+        grid_ax,
+        meta,
+        trace_p,
+        "viridis",
+        vmin=trace_limits[0],
+        vmax=trace_limits[1],
+    )
+    colorbars["trace_p"] = fig.colorbar(images["trace_p"], ax=grid_ax, fraction=0.046, pad=0.04)
+    colorbars["trace_p"].set_label("tr(P)")
+
     if not args.fixed_scale:
         z_limits = None
         contour_limits = None
+        trace_limits = None
 
     def draw(index: int) -> None:
         step = steps[index]
         arrays_now, meta_now = load_step(str(output_dir), step)
         fluxes_now = compute_fluxes(arrays_now, meta_now)
+        trace_p_now = pressure_trace(arrays_now, meta_now, nu)
+        x_now, y_now, extent_now = cell_center_axes(meta_now)
 
-        for ax, name in zip(axes, ["Q", "B", "u"]):
+        for ax, name in zip(field_axes, ["Q", "B", "u"]):
             psi = fluxes_now[name]
             z = arrays_now[VECTOR_FIELDS[name][2]]
             if contour_limits is None:
@@ -201,11 +421,11 @@ def main() -> int:
                 origin="lower",
                 cmap=args.cmap,
                 interpolation="nearest",
-                extent=(x[0], x[-1], y[0], y[-1]),
+                extent=extent_now,
                 vmin=z_vmin,
                 vmax=z_vmax,
             )
-            ax.contour(x, y, psi, levels=levels, linewidths=0.8, colors="black")
+            ax.contour(x_now, y_now, psi, levels=levels, linewidths=0.8, colors="black")
             field_z = VECTOR_FIELDS[name][2]
             ax.set_title(f"{field_z} + {name} flux contours")
             ax.set_xlabel("x")
@@ -213,9 +433,24 @@ def main() -> int:
             ax.set_aspect("equal")
             colorbars[name].update_normal(images[name])
 
+        if trace_limits is None:
+            trace_vmin, trace_vmax = safe_limits(trace_p_now)
+        else:
+            trace_vmin, trace_vmax = trace_limits
+
+        images["trace_p"] = draw_grid_layout(
+            grid_ax,
+            meta_now,
+            trace_p_now,
+            "viridis",
+            vmin=trace_vmin,
+            vmax=trace_vmax,
+        )
+        colorbars["trace_p"].update_normal(images["trace_p"])
+
         title.set_text(
             f"step={step}  time={meta_now['time']:.6g}  "
-            f"grid={meta_now['global_nx']}x{meta_now['global_ny']}"
+            f"grid={meta_now['global_nx']}x{meta_now['global_ny']}  levels={meta_now['finest_level'] + 1}"
         )
         fig.canvas.draw_idle()
 

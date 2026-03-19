@@ -1,25 +1,28 @@
-# 2D Canonical Vorticity EMHD Solver (MPI + OpenMP)
+# 2D Staggered EMHD Solver (AMReX)
 
-This project provides a modular C++ simulation code for 2D canonical vorticity evolution in EMHD:
+This code now runs a staggered single-level AMReX solver with:
 
-- `curl(B) = -u`
-- `Q = curl(u) - B = laplacian(B) - B`
-- `dQ/dt = curl(u x Q) + nu * laplacian(curl(u)) - eta * laplacian(B)`
+- single-level layout only
+- staggered vector storage:
+  `x` on horizontal edges, `y` on vertical edges, `z` on cell faces
+- periodic boundaries in `x` and `y`
 
-## Features
+The model is evolved with a cell-centered discretization of
 
-- 2D distributed domain decomposition with MPI Cartesian topology
-- OpenMP-parallelized stencil kernels
-- Explicit RK4 time integration for `Q`
-- Spectral Helmholtz solver for `laplacian(B) - B = Q` on periodic domains
-- Double current-sheet initialization with a flux-function perturbation for reconnection studies
-- HDF5 output (one file per rank per output step)
+- `u = -curl(B)`
+- `Q = laplacian(B) - B`
+- `dQ/dt = curl(u x Q) - curl(div(P)) - eta laplacian(B)`
 
-## Helmholtz Solver Notes
+The staggered curl operators preserve the discrete Stokes pairing exactly. By default
+the pressure contribution uses the symmetric closure
+`P = -nu * (grad(u) + grad(u)^T)`.
 
-- The Helmholtz solve now uses a 2D FFT-based spectral inversion of the discrete operator.
-- The current implementation requires `nx` and `ny` to be powers of two.
-- `helmholtz_max_iter` and `helmholtz_tol` are kept in config files for backward compatibility, but are not used by the spectral solver.
+`B` is recovered from `Q` by solving
+
+- `(I - laplacian) B = -Q`
+
+component-by-component with an FFT-based discrete Helmholtz inversion on power-of-two
+periodic grids. `nx` and `ny` must therefore both be powers of two.
 
 ## Build
 
@@ -28,21 +31,58 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-Dependencies:
-
-- MPI
-- OpenMP
-- HDF5 C library
-- CMake >= 3.20
-
 ## Run
 
 ```bash
-mpirun -np 4 ./build/qhd_emhd config/simulation.cfg
+./build/qhd_emhd config/simulation.py
 ```
 
-Output files:
+or
 
-- `output/step_XXXXXX_rank_YYYY.h5`
+```bash
+./build/qhd_emhd config/smoke.py
+```
 
-Each file stores local slab data and metadata attributes (`global_nx`, `global_ny`, local offsets, spacing, time, etc.).
+## Inputs
+
+The preferred input format is Python. Top-level scalar values such as
+
+- `nx`, `ny`, `lx`, `ly`
+- `dt`, `t_end`, `output_every`
+- `nu`, `eta`
+- `output_dir`
+
+are read directly.
+
+The solver advances with the user-provided `dt`. Only the last step may be shortened
+so the run lands exactly on `t_end`.
+
+If the same Python file also defines any of
+
+- `Bx(x, y)`, `By(x, y)`, `Bz(x, y)`
+- `Qx(x, y)`, `Qy(x, y)`, `Qz(x, y)`
+
+then it is used as the initialization namelist automatically.
+
+Those functions are evaluated on the solver staggering:
+
+- `Bx`, `Qx`: horizontal edges
+- `By`, `Qy`: vertical edges
+- `Bz`, `Qz`: cell faces
+
+If only `B` is provided, the solver computes `Q`.
+If only `Q` is provided, the solver solves for `B`.
+
+## Output
+
+The solver writes standard AMReX plotfiles:
+
+- `output/plt_XXXXXX`
+
+The solver writes cell-centered plotfile fields by averaging the staggered state:
+
+- `Bx`, `By`, `Bz`
+- `Ux`, `Uy`, `Uz`
+- `Qx`, `Qy`, `Qz`
+
+The existing reader/viewer scripts still work on those plotfiles.

@@ -4,4 +4,5 @@ output/
 *.o
 *.so
 .DS_Store
-build_local/
+output_smoke/
+QHD.code-workspace
