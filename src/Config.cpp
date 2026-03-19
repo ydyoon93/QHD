@@ -1,5 +1,7 @@
 #include "Config.hpp"
 
+#include <AMReX_ParallelDescriptor.H>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -75,21 +77,30 @@ SimulationConfig SimulationConfig::from_file(const std::string& path) {
             std::filesystem::temp_directory_path() /
             ("qhd_python_cfg_" + std::to_string(static_cast<long long>(std::time(nullptr))) + ".cfg");
 
-        std::ostringstream cmd;
-        cmd << "python3 " << quote_shell_arg(helper_path.string())
-            << " --input " << quote_shell_arg(abs_input.string())
-            << " --output " << quote_shell_arg(temp_cfg.string());
-        const int rc = std::system(cmd.str().c_str());
-        if (rc != 0) {
-            throw std::runtime_error("Python config rendering failed for '" + abs_input.string() +
-                                     "' with exit code " + std::to_string(rc));
+        if (amrex::ParallelDescriptor::IOProcessor()) {
+            std::ostringstream cmd;
+            cmd << "python3 " << quote_shell_arg(helper_path.string())
+                << " --input " << quote_shell_arg(abs_input.string())
+                << " --output " << quote_shell_arg(temp_cfg.string());
+            const int rc = std::system(cmd.str().c_str());
+            if (rc != 0) {
+                throw std::runtime_error("Python config rendering failed for '" + abs_input.string() +
+                                         "' with exit code " + std::to_string(rc));
+            }
         }
+
+        amrex::ParallelDescriptor::Barrier();
 
         SimulationConfig cfg = SimulationConfig::from_file(temp_cfg.string());
         cfg.config_path = abs_input.string();
         cfg.config_dir = abs_input.parent_path().string();
-        std::error_code ec;
-        std::filesystem::remove(temp_cfg, ec);
+
+        amrex::ParallelDescriptor::Barrier();
+        if (amrex::ParallelDescriptor::IOProcessor()) {
+            std::error_code ec;
+            std::filesystem::remove(temp_cfg, ec);
+        }
+        amrex::ParallelDescriptor::Barrier();
         return cfg;
     }
 

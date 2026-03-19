@@ -3,6 +3,7 @@
 #include <AMReX.H>
 #include <AMReX_Array4.H>
 #include <AMReX_Box.H>
+#include <AMReX_FFT.H>
 #include <AMReX_MFIter.H>
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_PlotFileUtil.H>
@@ -10,7 +11,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <cstdlib>
 #include <cstdint>
 #include <ctime>
@@ -27,78 +27,6 @@
 namespace {
 
 using namespace amrex;
-
-constexpr double PI = 3.141592653589793238462643383279502884;
-
-bool is_power_of_two(int n) {
-    return n > 0 && (n & (n - 1)) == 0;
-}
-
-void fft_1d(std::vector<std::complex<double>>& a, bool inverse) {
-    const int n = static_cast<int>(a.size());
-
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        while ((j & bit) != 0) {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j ^= bit;
-        if (i < j) {
-            std::swap(a[i], a[j]);
-        }
-    }
-
-    for (int len = 2; len <= n; len <<= 1) {
-        const double ang = 2.0 * PI / static_cast<double>(len) * (inverse ? 1.0 : -1.0);
-        const std::complex<double> wlen(std::cos(ang), std::sin(ang));
-
-        for (int i = 0; i < n; i += len) {
-            std::complex<double> w(1.0, 0.0);
-            const int half = len / 2;
-            for (int j = 0; j < half; ++j) {
-                const std::complex<double> u = a[i + j];
-                const std::complex<double> v = a[i + j + half] * w;
-                a[i + j] = u + v;
-                a[i + j + half] = u - v;
-                w *= wlen;
-            }
-        }
-    }
-
-    if (inverse) {
-        const double inv_n = 1.0 / static_cast<double>(n);
-        for (auto& v : a) {
-            v *= inv_n;
-        }
-    }
-}
-
-void fft_2d(std::vector<std::complex<double>>& data, int nx, int ny, bool inverse) {
-    std::vector<std::complex<double>> line(static_cast<std::size_t>(std::max(nx, ny)));
-
-    for (int j = 0; j < ny; ++j) {
-        for (int i = 0; i < nx; ++i) {
-            line[i] = data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)];
-        }
-        line.resize(nx);
-        fft_1d(line, inverse);
-        for (int i = 0; i < nx; ++i) {
-            data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)] = line[i];
-        }
-    }
-
-    for (int i = 0; i < nx; ++i) {
-        for (int j = 0; j < ny; ++j) {
-            line[j] = data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)];
-        }
-        line.resize(ny);
-        fft_1d(line, inverse);
-        for (int j = 0; j < ny; ++j) {
-            data[static_cast<std::size_t>(i) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(j)] = line[j];
-        }
-    }
-}
 
 Geometry make_geometry(int nx, int ny, double lx, double ly) {
     IntVect dom_lo(AMREX_D_DECL(0, 0, 0));
@@ -239,13 +167,9 @@ void ensure_finite_field(const char* label, const vecops::VectorField2D& field) 
 
 Simulation::Simulation(const SimulationConfig& cfg)
     : cfg_(cfg) {
-    if (!is_power_of_two(cfg_.nx) || !is_power_of_two(cfg_.ny)) {
-        throw std::runtime_error("FFT Helmholtz inversion requires power-of-two nx and ny; got nx=" +
-                                 std::to_string(cfg_.nx) + ", ny=" + std::to_string(cfg_.ny));
-    }
-
     const Geometry geom = make_geometry(cfg_.nx, cfg_.ny, cfg_.lx, cfg_.ly);
     define_level(geom, make_box_array(geom.Domain()));
+    helmholtz_fft_ = std::make_unique<FFT::R2C<Real>>(level_.geom.Domain());
     initialize_state();
 
     if (!init_has_b_ && init_has_q_) {
@@ -262,7 +186,7 @@ Simulation::Simulation(const SimulationConfig& cfg)
     }
 
     if (ParallelDescriptor::IOProcessor()) {
-        Print() << "Initialized staggered single-level AMReX solver with FFT Helmholtz inversion\n";
+        Print() << "Initialized staggered single-level AMReX solver with AMReX FFT Helmholtz inversion\n";
     }
 }
 
@@ -556,67 +480,26 @@ void Simulation::compute_rhs(const VectorField& b,
 void Simulation::solve_helmholtz() {
     const int nx = level_.geom.Domain().length(0);
     const int ny = level_.geom.Domain().length(1);
-    const Box domain = level_.geom.Domain();
-    BoxArray spectral_ba(domain);
-    DistributionMapping spectral_dmap(Vector<int>{ParallelDescriptor::IOProcessorNumber()});
-    MultiFab spectral_field(spectral_ba, spectral_dmap, 1, 0);
-    std::vector<std::complex<double>> spectrum(static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny));
-    const double idx2 = 1.0 / (level_.geom.CellSize(0) * level_.geom.CellSize(0));
-    const double idy2 = 1.0 / (level_.geom.CellSize(1) * level_.geom.CellSize(1));
+    const Real idx2 = Real(1.0) / (level_.geom.CellSize(0) * level_.geom.CellSize(0));
+    const Real idy2 = Real(1.0) / (level_.geom.CellSize(1) * level_.geom.CellSize(1));
+    const Real two_pi = Real(2.0) * Math::pi<Real>();
+    const Real scaling = helmholtz_fft_->scalingFactor();
 
     for (int comp = 0; comp < 3; ++comp) {
         MultiFab& bcomp = level_.b.comp[comp];
         const MultiFab& qcomp = level_.q.comp[comp];
         ensure_finite("Helmholtz q", qcomp);
 
-        spectral_field.setVal(0.0);
-        spectral_field.ParallelCopy(qcomp, 0, 0, 1);
-
-        if (ParallelDescriptor::IOProcessor()) {
-            for (MFIter mfi(spectral_field); mfi.isValid(); ++mfi) {
-                const auto arr = spectral_field.array(mfi);
-                for (int j = domain.smallEnd(1); j <= domain.bigEnd(1); ++j) {
-                    for (int i = domain.smallEnd(0); i <= domain.bigEnd(0); ++i) {
-                        const std::size_t idx =
-                            static_cast<std::size_t>(i - domain.smallEnd(0)) +
-                            static_cast<std::size_t>(nx) * static_cast<std::size_t>(j - domain.smallEnd(1));
-                        spectrum[idx] = std::complex<double>(arr(i, j, 0), 0.0);
-                    }
-                }
-            }
-
-            fft_2d(spectrum, nx, ny, false);
-
-            for (int ky = 0; ky < ny; ++ky) {
-                const double theta_y = 2.0 * PI * static_cast<double>(ky) / static_cast<double>(ny);
-                const double lambda_y = 2.0 * (std::cos(theta_y) - 1.0) * idy2;
-
-                for (int kx = 0; kx < nx; ++kx) {
-                    const double theta_x = 2.0 * PI * static_cast<double>(kx) / static_cast<double>(nx);
-                    const double lambda_x = 2.0 * (std::cos(theta_x) - 1.0) * idx2;
-                    const double denom = (lambda_x + lambda_y) - 1.0;
-                    const std::size_t idx =
-                        static_cast<std::size_t>(kx) + static_cast<std::size_t>(nx) * static_cast<std::size_t>(ky);
-                    spectrum[idx] /= denom;
-                }
-            }
-
-            fft_2d(spectrum, nx, ny, true);
-
-            for (MFIter mfi(spectral_field); mfi.isValid(); ++mfi) {
-                const auto arr = spectral_field.array(mfi);
-                for (int j = domain.smallEnd(1); j <= domain.bigEnd(1); ++j) {
-                    for (int i = domain.smallEnd(0); i <= domain.bigEnd(0); ++i) {
-                        const std::size_t idx =
-                            static_cast<std::size_t>(i - domain.smallEnd(0)) +
-                            static_cast<std::size_t>(nx) * static_cast<std::size_t>(j - domain.smallEnd(1));
-                        arr(i, j, 0) = spectrum[idx].real();
-                    }
-                }
-            }
-        }
-
-        bcomp.ParallelCopy(spectral_field, 0, 0, 1);
+        helmholtz_fft_->forwardThenBackward(
+            qcomp, bcomp,
+            [=] AMREX_GPU_DEVICE(int kx, int ky, int, auto& sp) noexcept {
+                const Real theta_x = two_pi * static_cast<Real>(kx) / static_cast<Real>(nx);
+                const Real theta_y = two_pi * static_cast<Real>(ky) / static_cast<Real>(ny);
+                const Real lambda_x = Real(2.0) * (std::cos(theta_x) - Real(1.0)) * idx2;
+                const Real lambda_y = Real(2.0) * (std::cos(theta_y) - Real(1.0)) * idy2;
+                const Real denom = (lambda_x + lambda_y) - Real(1.0);
+                sp *= scaling / denom;
+            });
         ensure_finite("Helmholtz b", bcomp);
     }
 }

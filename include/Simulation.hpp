@@ -3,10 +3,12 @@
 #include <AMReX_Array.H>
 #include <AMReX_BoxArray.H>
 #include <AMReX_DistributionMapping.H>
+#include <AMReX_FFT.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_IntVect.H>
 #include <AMReX_MultiFab.H>
 
+#include <memory>
 #include <string>
 
 #include "Config.hpp"
@@ -61,6 +63,7 @@ private:
     SimulationConfig cfg_;
     amrex::IntVect ng_{AMREX_D_DECL(2, 2, 0)};
     LevelData level_;
+    std::unique_ptr<amrex::FFT::R2C<amrex::Real>> helmholtz_fft_;
     bool init_has_b_ = false;
     bool init_has_q_ = false;
     bool init_b_ghosts_ready_ = false;

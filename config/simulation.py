@@ -1,15 +1,15 @@
 import numpy as np
 
-nx = 256
-ny = 128
-lx = 80.0
-ly = 40.0
+nx = 1024
+ny = 512
+lx = 40.0
+ly = 20.0
 dx = lx / nx
 dy = ly / ny
 
 dt_cfl = (dx**-2 + dy**-2) ** (-0.5)
 dt = dt_cfl * .5
-t_end = 500.0
+t_end = 600.0
 output_every = int(t_end / dt / 100)
 
 nu = 5.0e-3

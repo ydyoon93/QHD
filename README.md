@@ -21,8 +21,8 @@ the pressure contribution uses the symmetric closure
 
 - `(I - laplacian) B = -Q`
 
-component-by-component with an FFT-based discrete Helmholtz inversion on power-of-two
-periodic grids. `nx` and `ny` must therefore both be powers of two.
+component-by-component with AMReX's FFT-based discrete Helmholtz inversion on
+periodic grids. On CPU builds this uses FFTW through AMReX.
 
 ## Build
 
@@ -30,6 +30,10 @@ periodic grids. `nx` and `ny` must therefore both be powers of two.
 cmake -S . -B build
 cmake --build build -j
 ```
+
+The build expects OpenMP-enabled `fftw3` to be available because the Helmholtz
+inversion now uses AMReX FFT on CPU and links the threaded FFTW backend when
+`AMReX_OMP` is enabled.
 
 ## Run
 
