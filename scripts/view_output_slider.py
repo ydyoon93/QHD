@@ -24,14 +24,20 @@ VECTOR_FIELDS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", default="output", help="Directory with AMReX plotfiles `plt_XXXXXX`")
+    parser.add_argument("--output-dir", default="output", help="Directory with AMReX plotfiles `plt_XXXXXX` or `plt_XXXXXX.h5`")
     parser.add_argument("--start-step", type=int, default=None, help="Initial step (default: latest)")
     parser.add_argument("--levels", type=int, default=16, help="Number of contour levels per subplot")
     parser.add_argument("--cmap", default="RdBu_r", help="Matplotlib colormap for z-component background")
     parser.add_argument(
         "--fixed-scale",
         action="store_true",
-        help="Use fixed color/contour ranges per field from the first displayed step",
+        help="Use fixed robust color/contour ranges scanned over all available steps",
+    )
+    parser.add_argument(
+        "--outlier-percentile",
+        type=float,
+        default=1.0,
+        help="Clip this percentile from each tail when computing fixed global ranges (default: 1.0)",
     )
     return parser.parse_args()
 
@@ -39,6 +45,37 @@ def parse_args() -> argparse.Namespace:
 def safe_limits(arr: np.ndarray) -> tuple[float, float]:
     vmin = float(np.nanmin(arr))
     vmax = float(np.nanmax(arr))
+    if np.isclose(vmin, vmax):
+        eps = max(1.0e-12, abs(vmin) * 1.0e-6 + 1.0e-12)
+        return vmin - eps, vmax + eps
+    return vmin, vmax
+
+
+def robust_limits(arr: np.ndarray, outlier_percentile: float) -> tuple[float, float]:
+    if outlier_percentile <= 0.0:
+        return safe_limits(arr)
+    if outlier_percentile >= 50.0:
+        raise ValueError("outlier_percentile must be in [0, 50)")
+
+    finite = np.asarray(arr, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return -1.0, 1.0
+
+    vmin = float(np.percentile(finite, outlier_percentile))
+    vmax = float(np.percentile(finite, 100.0 - outlier_percentile))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return safe_limits(finite)
+    if np.isclose(vmin, vmax):
+        return safe_limits(finite)
+    return vmin, vmax
+
+
+def merge_limits(limits: list[tuple[float, float]]) -> tuple[float, float]:
+    if not limits:
+        return -1.0, 1.0
+    vmin = min(pair[0] for pair in limits)
+    vmax = max(pair[1] for pair in limits)
     if np.isclose(vmin, vmax):
         eps = max(1.0e-12, abs(vmin) * 1.0e-6 + 1.0e-12)
         return vmin - eps, vmax + eps
@@ -108,6 +145,39 @@ def compute_fluxes(arrays: dict[str, np.ndarray], meta: dict) -> dict[str, np.nd
     for name, (field_x, field_y, _) in VECTOR_FIELDS.items():
         fluxes[name] = inplane_flux_function(arrays[field_x], arrays[field_y], dx, dy)
     return fluxes
+
+
+def compute_global_display_limits(
+    output_dir: pathlib.Path,
+    steps: list[int],
+    outlier_percentile: float,
+) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]], tuple[float, float]]:
+    z_limits_per_step: dict[str, list[tuple[float, float]]] = {name: [] for name in VECTOR_FIELDS}
+    contour_limits_per_step: dict[str, list[tuple[float, float]]] = {name: [] for name in VECTOR_FIELDS}
+    pxy_limits_per_step: list[tuple[float, float]] = []
+
+    for idx, step in enumerate(steps, start=1):
+        arrays, meta = load_step(str(output_dir), step)
+        if "Pxy" not in arrays:
+            raise RuntimeError(f"Pxy is not available in plotfile for step {step}")
+        fluxes = compute_fluxes(arrays, meta)
+
+        for name in VECTOR_FIELDS:
+            z = arrays[VECTOR_FIELDS[name][2]]
+            psi = fluxes[name]
+            z_limits_per_step[name].append(robust_limits(z, outlier_percentile))
+            contour_limits_per_step[name].append(robust_limits(psi, outlier_percentile))
+
+        pxy_limits_per_step.append(robust_limits(arrays["Pxy"], outlier_percentile))
+
+        if idx == 1 or idx == len(steps) or idx % 10 == 0:
+            print(f"[scan] {idx}/{len(steps)} steps", file=sys.stderr)
+
+    return (
+        {name: merge_limits(limits) for name, limits in z_limits_per_step.items()},
+        {name: merge_limits(limits) for name, limits in contour_limits_per_step.items()},
+        merge_limits(pxy_limits_per_step),
+    )
 
 
 def cell_center_axes(meta: dict) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
@@ -276,7 +346,13 @@ def main() -> int:
     colorbars["pxy"] = fig.colorbar(images["pxy"], ax=grid_ax, fraction=0.046, pad=0.04)
     colorbars["pxy"].set_label("Pxy")
 
-    if not args.fixed_scale:
+    if args.fixed_scale:
+        z_limits, contour_limits, pxy_limits = compute_global_display_limits(
+            output_dir,
+            steps,
+            args.outlier_percentile,
+        )
+    else:
         z_limits = None
         contour_limits = None
         pxy_limits = None

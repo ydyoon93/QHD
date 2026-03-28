@@ -1,5 +1,5 @@
 build/
-output/
+output*
 *.h5
 *.o
 *.so

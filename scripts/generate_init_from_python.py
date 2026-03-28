@@ -41,6 +41,9 @@ def component_meshes(nx, ny, dx, dy, staggered):
             "Qx": (xg, yg),
             "Qy": (xg, yg),
             "Qz": (xg, yg),
+            "Ux": (xg, yg),
+            "Uy": (xg, yg),
+            "Uz": (xg, yg),
         }
 
     x_edge_x = (np.arange(nx, dtype=np.float64) + 0.5) * dx
@@ -60,7 +63,47 @@ def component_meshes(nx, ny, dx, dy, staggered):
         "Qx": (xgx, ygx),
         "Qy": (xgy, ygy),
         "Qz": (xgz, ygz),
+        "Ux": (xgx, ygx),
+        "Uy": (xgy, ygy),
+        "Uz": (xgz, ygz),
     }
+
+
+def reconstruct_b_from_u(ux, uy, uz, dx, dy):
+    ny, nx = ux.shape
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=dx)
+    ky = 2.0 * np.pi * np.fft.fftfreq(ny, d=dy)
+    kx2d = kx[None, :]
+    ky2d = ky[:, None]
+
+    dx_backward = (1.0 - np.exp(-1j * kx2d * dx)) / dx
+    dy_backward = (1.0 - np.exp(-1j * ky2d * dy)) / dy
+    dx_forward = (np.exp(1j * kx2d * dx) - 1.0) / dx
+    dy_forward = (np.exp(1j * ky2d * dy) - 1.0) / dy
+
+    ux_hat = np.fft.fft2(ux)
+    uy_hat = np.fft.fft2(uy)
+    uz_hat = np.fft.fft2(uz)
+
+    bz_hat = np.zeros_like(ux_hat, dtype=np.complex128)
+    denom_bz = np.abs(dx_backward) ** 2 + np.abs(dy_backward) ** 2
+    mask_bz = denom_bz > 0.0
+    numer_bz = -np.conj(dy_backward) * ux_hat + np.conj(dx_backward) * uy_hat
+    bz_hat[mask_bz] = numer_bz[mask_bz] / denom_bz[mask_bz]
+
+    bx_hat = np.zeros_like(uz_hat, dtype=np.complex128)
+    by_hat = np.zeros_like(uz_hat, dtype=np.complex128)
+    denom_xy = np.abs(dx_forward) ** 2 + np.abs(dy_forward) ** 2
+    mask_xy = denom_xy > 0.0
+    numer_bx = np.conj(dy_forward) * uz_hat
+    numer_by = -np.conj(dx_forward) * uz_hat
+    bx_hat[mask_xy] = numer_bx[mask_xy] / denom_xy[mask_xy]
+    by_hat[mask_xy] = numer_by[mask_xy] / denom_xy[mask_xy]
+
+    bx = np.fft.ifft2(bx_hat).real
+    by = np.fft.ifft2(by_hat).real
+    bz = np.fft.ifft2(bz_hat).real
+    return bx, by, bz
 
 
 def main() -> int:
@@ -104,18 +147,32 @@ def main() -> int:
         "qx.npy": evaluate_component(funcs, "Qx", *meshes["Qx"], (args.ny, args.nx)),
         "qy.npy": evaluate_component(funcs, "Qy", *meshes["Qy"], (args.ny, args.nx)),
         "qz.npy": evaluate_component(funcs, "Qz", *meshes["Qz"], (args.ny, args.nx)),
+        "ux.npy": evaluate_component(funcs, "Ux", *meshes["Ux"], (args.ny, args.nx)),
+        "uy.npy": evaluate_component(funcs, "Uy", *meshes["Uy"], (args.ny, args.nx)),
+        "uz.npy": evaluate_component(funcs, "Uz", *meshes["Uz"], (args.ny, args.nx)),
     }
 
     has_b = all(fields[name] is not None for name in ("bx.npy", "by.npy", "bz.npy"))
     has_q = all(fields[name] is not None for name in ("qx.npy", "qy.npy", "qz.npy"))
-    if not has_b and not has_q:
-        raise ValueError("The Python namelist must define either Bx/By/Bz or Qx/Qy/Qz")
+    has_u = all(fields[name] is not None for name in ("ux.npy", "uy.npy", "uz.npy"))
+    if not has_b and not has_q and not has_u:
+        raise ValueError("The Python namelist must define either Bx/By/Bz, Qx/Qy/Qz, or Ux/Uy/Uz")
     if any(fields[name] is not None for name in ("bx.npy", "by.npy", "bz.npy")) and not has_b:
         raise ValueError("If any of Bx, By, Bz is defined, all three must be defined")
     if any(fields[name] is not None for name in ("qx.npy", "qy.npy", "qz.npy")) and not has_q:
         raise ValueError("If any of Qx, Qy, Qz is defined, all three must be defined")
+    if any(fields[name] is not None for name in ("ux.npy", "uy.npy", "uz.npy")) and not has_u:
+        raise ValueError("If any of Ux, Uy, Uz is defined, all three must be defined")
+
+    if has_u and not has_b and not has_q:
+        bx, by, bz = reconstruct_b_from_u(fields["ux.npy"], fields["uy.npy"], fields["uz.npy"], dx, dy)
+        fields["bx.npy"] = bx
+        fields["by.npy"] = by
+        fields["bz.npy"] = bz
 
     for filename, array in fields.items():
+        if filename.startswith("u"):
+            continue
         if array is not None:
             np.save(out_dir / filename, array)
 

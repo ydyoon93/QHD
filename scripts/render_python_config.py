@@ -59,7 +59,10 @@ def main() -> int:
         value = normalize_value(key, user_ns[key], input_path.parent)
         lines.append(f"{key} = {int(value) if isinstance(value, bool) else value}")
 
-    has_field_functions = any(callable(user_ns.get(name)) or name in user_ns for name in ("Bx", "By", "Bz", "Qx", "Qy", "Qz"))
+    has_field_functions = any(
+        callable(user_ns.get(name)) or name in user_ns
+        for name in ("Bx", "By", "Bz", "Qx", "Qy", "Qz", "Ux", "Uy", "Uz")
+    )
     if has_field_functions and "init_python_namelist" not in user_ns:
         lines.append(f"init_python_namelist = {input_path}")
 

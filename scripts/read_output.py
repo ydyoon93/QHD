@@ -9,9 +9,14 @@ import re
 import sys
 from dataclasses import dataclass
 
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
 import numpy as np
 
-PLOTFILE_RE = re.compile(r"plt_(\d{6})$")
+PLOTFILE_RE = re.compile(r"plt_(\d{6})(?:\.h5)?$")
 BOX_RE = re.compile(r"\(\(([-\d]+),([-\d]+)\)\s+\(([-\d]+),([-\d]+)\)\s+\(([-\d]+),([-\d]+)\)\)")
 FAB_RE = re.compile(r"FabOnDisk:\s+(\S+)\s+(\d+)")
 
@@ -26,17 +31,56 @@ class FabRecord:
     offset: int
 
 
+def _is_hdf5_plotfile(path: pathlib.Path) -> bool:
+    return path.is_file() and path.suffix == ".h5"
+
+
+def _require_h5py() -> None:
+    if h5py is None:
+        raise RuntimeError("h5py is required to read AMReX HDF5 plotfiles")
+
+
+def _decode_string(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.bytes_):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _as_scalar_int(value: object) -> int:
+    return int(np.asarray(value).item())
+
+
+def _as_scalar_float(value: object) -> float:
+    return float(np.asarray(value).item())
+
+
+def _compound_box_to_dict(record: np.void) -> dict[str, int]:
+    names = set(record.dtype.names or ())
+    return {
+        "lo_i": int(record["lo_i"]),
+        "lo_j": int(record["lo_j"] if "lo_j" in names else 0),
+        "hi_i": int(record["hi_i"]),
+        "hi_j": int(record["hi_j"] if "hi_j" in names else 0),
+    }
+
+
 def discover_steps(output_dir: pathlib.Path) -> list[int]:
     steps: set[int] = set()
     for path in output_dir.glob("plt_*"):
-        if path.is_dir():
-            match = PLOTFILE_RE.match(path.name)
-            if match:
-                steps.add(int(match.group(1)))
+        if not path.is_dir() and not _is_hdf5_plotfile(path):
+            continue
+        match = PLOTFILE_RE.fullmatch(path.name)
+        if match:
+            steps.add(int(match.group(1)))
     return sorted(steps)
 
 
 def plotfile_for_step(output_dir: pathlib.Path, step: int) -> pathlib.Path:
+    hdf5_path = output_dir / f"plt_{step:06d}.h5"
+    if hdf5_path.exists():
+        return hdf5_path
     return output_dir / f"plt_{step:06d}"
 
 
@@ -47,7 +91,7 @@ def _read_header_lines(plotfile_dir: pathlib.Path) -> list[str]:
     return [line.rstrip() for line in header_path.read_text().splitlines() if line.strip()]
 
 
-def read_plotfile_metadata(plotfile_dir: pathlib.Path) -> dict:
+def _read_plotfile_metadata_directory(plotfile_dir: pathlib.Path) -> dict:
     lines = _read_header_lines(plotfile_dir)
     idx = 0
 
@@ -154,6 +198,86 @@ def read_plotfile_metadata(plotfile_dir: pathlib.Path) -> dict:
     }
 
 
+def _read_plotfile_metadata_hdf5(plotfile_path: pathlib.Path) -> dict:
+    _require_h5py()
+    with h5py.File(plotfile_path, "r") as h5:
+        nvars = _as_scalar_int(h5.attrs["num_components"])
+        finest_level = _as_scalar_int(h5.attrs["finest_level"])
+        levels = []
+        domains = []
+        cell_sizes = []
+        ref_ratio = []
+        level_steps = []
+
+        prob_lo: tuple[float, ...] | None = None
+        prob_hi: tuple[float, ...] | None = None
+
+        for lev in range(finest_level + 1):
+            grp = h5[f"level_{lev}"]
+            domain = _compound_box_to_dict(grp.attrs["prob_domain"])
+            domains.append(domain)
+
+            level_prob_lo = tuple(float(x) for x in np.asarray(grp.attrs["prob_lo"], dtype=np.float64))
+            level_prob_hi = tuple(float(x) for x in np.asarray(grp.attrs["prob_hi"], dtype=np.float64))
+            if prob_lo is None:
+                prob_lo = level_prob_lo
+                prob_hi = level_prob_hi
+
+            dx_vec = tuple(float(x) for x in np.asarray(grp.attrs["Vec_dx"], dtype=np.float64))
+            cell_sizes.append(dx_vec)
+
+            level_ref_ratio = _as_scalar_int(grp.attrs["ref_ratio"])
+            if lev < finest_level:
+                ref_ratio.append(level_ref_ratio)
+
+            level_step = _as_scalar_int(grp.attrs["steps"])
+            level_steps.append(level_step)
+            levels.append(
+                {
+                    "level": lev,
+                    "ref_ratio_to_next": level_ref_ratio,
+                    "time": _as_scalar_float(grp.attrs["time"]),
+                    "step": level_step,
+                    "extent_lines": [],
+                    "data_rel_path": f"level_{lev}",
+                }
+            )
+
+        if prob_lo is None or prob_hi is None:
+            raise RuntimeError(f"No levels found in HDF5 plotfile {plotfile_path}")
+
+        finest_domain = domains[-1]
+        global_nx = finest_domain["hi_i"] - finest_domain["lo_i"] + 1
+        global_ny = finest_domain["hi_j"] - finest_domain["lo_j"] + 1
+
+        return {
+            "version": _decode_string(h5.attrs["version_name"]),
+            "nvars": nvars,
+            "varnames": [_decode_string(h5.attrs[f"component_{i}"]) for i in range(nvars)],
+            "space_dim": _as_scalar_int(h5.attrs["dim"]),
+            "time": _as_scalar_float(h5.attrs["time"]),
+            "step": level_steps[0],
+            "prob_lo": prob_lo,
+            "prob_hi": prob_hi,
+            "coord_sys": _as_scalar_int(h5.attrs["coordinate_system"]),
+            "finest_level": finest_level,
+            "ref_ratio": ref_ratio,
+            "domains": domains,
+            "cell_sizes": cell_sizes,
+            "levels": levels,
+            "global_nx": global_nx,
+            "global_ny": global_ny,
+            "dx": cell_sizes[-1][0],
+            "dy": cell_sizes[-1][1],
+        }
+
+
+def read_plotfile_metadata(plotfile_path: pathlib.Path) -> dict:
+    if _is_hdf5_plotfile(plotfile_path):
+        return _read_plotfile_metadata_hdf5(plotfile_path)
+    return _read_plotfile_metadata_directory(plotfile_path)
+
+
 def _parse_cell_header(cell_header_path: pathlib.Path) -> tuple[list[FabRecord], int]:
     lines = [line.strip() for line in cell_header_path.read_text().splitlines() if line.strip()]
     ncomp = int(lines[2])
@@ -213,30 +337,54 @@ def _scale_to_finest(meta: dict, lev: int) -> int:
     return scale
 
 
-def read_grid_layout(plotfile_dir: pathlib.Path) -> dict:
-    meta = read_plotfile_metadata(plotfile_dir)
+def read_grid_layout(plotfile_path: pathlib.Path) -> dict:
+    meta = read_plotfile_metadata(plotfile_path)
     levels: list[dict] = []
 
-    for lev in range(meta["finest_level"] + 1):
-        level_dir = plotfile_dir / f"Level_{lev}"
-        fabs, _ncomp = _parse_cell_header(level_dir / "Cell_H")
-        scale = _scale_to_finest(meta, lev)
-        boxes = []
-        for fab in fabs:
-            boxes.append(
-                {
-                    "lo_i": fab.lo_i,
-                    "lo_j": fab.lo_j,
-                    "hi_i": fab.hi_i,
-                    "hi_j": fab.hi_j,
-                    "scale_to_finest": scale,
-                    "lo_x": fab.lo_i * scale,
-                    "lo_y": fab.lo_j * scale,
-                    "hi_x": (fab.hi_i + 1) * scale,
-                    "hi_y": (fab.hi_j + 1) * scale,
-                }
-            )
-        levels.append({"level": lev, "boxes": boxes})
+    if _is_hdf5_plotfile(plotfile_path):
+        _require_h5py()
+        with h5py.File(plotfile_path, "r") as h5:
+            for lev in range(meta["finest_level"] + 1):
+                grp = h5[f"level_{lev}"]
+                scale = _scale_to_finest(meta, lev)
+                boxes = []
+                for box_record in grp["boxes"][:]:
+                    box = _compound_box_to_dict(box_record)
+                    boxes.append(
+                        {
+                            "lo_i": box["lo_i"],
+                            "lo_j": box["lo_j"],
+                            "hi_i": box["hi_i"],
+                            "hi_j": box["hi_j"],
+                            "scale_to_finest": scale,
+                            "lo_x": box["lo_i"] * scale,
+                            "lo_y": box["lo_j"] * scale,
+                            "hi_x": (box["hi_i"] + 1) * scale,
+                            "hi_y": (box["hi_j"] + 1) * scale,
+                        }
+                    )
+                levels.append({"level": lev, "boxes": boxes})
+    else:
+        for lev in range(meta["finest_level"] + 1):
+            level_dir = plotfile_path / f"Level_{lev}"
+            fabs, _ncomp = _parse_cell_header(level_dir / "Cell_H")
+            scale = _scale_to_finest(meta, lev)
+            boxes = []
+            for fab in fabs:
+                boxes.append(
+                    {
+                        "lo_i": fab.lo_i,
+                        "lo_j": fab.lo_j,
+                        "hi_i": fab.hi_i,
+                        "hi_j": fab.hi_j,
+                        "scale_to_finest": scale,
+                        "lo_x": fab.lo_i * scale,
+                        "lo_y": fab.lo_j * scale,
+                        "hi_x": (fab.hi_i + 1) * scale,
+                        "hi_y": (fab.hi_j + 1) * scale,
+                    }
+                )
+            levels.append({"level": lev, "boxes": boxes})
 
     return {
         "global_nx": meta["global_nx"],
@@ -250,7 +398,7 @@ def read_grid_layout(plotfile_dir: pathlib.Path) -> dict:
     }
 
 
-def read_global_field(plotfile_dir: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
+def _read_global_field_directory(plotfile_dir: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
     meta = read_plotfile_metadata(plotfile_dir)
     if field not in meta["varnames"]:
         raise RuntimeError(f"Field '{field}' not found in plotfile {plotfile_dir}")
@@ -281,9 +429,80 @@ def read_global_field(plotfile_dir: pathlib.Path, field: str) -> tuple[np.ndarra
     return out, meta
 
 
+def _read_hdf5_block(grp: h5py.Group, comp: int, ncomp: int, start: int, end: int, nx: int, ny: int) -> np.ndarray:
+    single_dataset_name = "data:datatype=0"
+    if single_dataset_name in grp:
+        block = np.asarray(grp[single_dataset_name][start:end], dtype=np.float64)
+        expected = ncomp * nx * ny
+        if block.size != expected:
+            raise RuntimeError(
+                f"Unexpected HDF5 dataset size in group {grp.name}: expected {expected} values, got {block.size}"
+            )
+        return block.reshape((ncomp, ny, nx))[comp]
+
+    multi_dataset_name = f"data:datatype={comp}"
+    if multi_dataset_name in grp:
+        block = np.asarray(grp[multi_dataset_name][start:end], dtype=np.float64)
+        expected = nx * ny
+        if block.size != expected:
+            raise RuntimeError(
+                f"Unexpected HDF5 dataset size in group {grp.name}: expected {expected} values, got {block.size}"
+            )
+        return block.reshape((ny, nx))
+
+    raise RuntimeError(f"No AMReX field dataset found for component {comp} in HDF5 group {grp.name}")
+
+
+def _read_global_field_hdf5(plotfile_path: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
+    _require_h5py()
+    meta = read_plotfile_metadata(plotfile_path)
+    if field not in meta["varnames"]:
+        raise RuntimeError(f"Field '{field}' not found in plotfile {plotfile_path}")
+
+    comp = meta["varnames"].index(field)
+    out = np.zeros((meta["global_ny"], meta["global_nx"]), dtype=np.float64)
+
+    with h5py.File(plotfile_path, "r") as h5:
+        for lev in range(meta["finest_level"] + 1):
+            grp = h5[f"level_{lev}"]
+            boxes = grp["boxes"][:]
+            offsets = np.asarray(grp["data:offsets=0"][:], dtype=np.int64)
+            if len(offsets) != len(boxes) + 1:
+                raise RuntimeError(f"Unexpected offsets size in HDF5 group {grp.name}")
+
+            scale = _scale_to_finest(meta, lev)
+            for idx, box_record in enumerate(boxes):
+                box = _compound_box_to_dict(box_record)
+                nx = box["hi_i"] - box["lo_i"] + 1
+                ny = box["hi_j"] - box["lo_j"] + 1
+                start = int(offsets[idx])
+                end = int(offsets[idx + 1])
+                block = _read_hdf5_block(grp, comp, meta["nvars"], start, end, nx, ny)
+
+                for j in range(ny):
+                    dst_j0 = (box["lo_j"] + j) * scale
+                    dst_j1 = dst_j0 + scale
+                    for i in range(nx):
+                        dst_i0 = (box["lo_i"] + i) * scale
+                        dst_i1 = dst_i0 + scale
+                        out[dst_j0:dst_j1, dst_i0:dst_i1] = block[j, i]
+
+    return out, meta
+
+
+def read_global_field(plotfile_path: pathlib.Path, field: str) -> tuple[np.ndarray, dict]:
+    if _is_hdf5_plotfile(plotfile_path):
+        return _read_global_field_hdf5(plotfile_path, field)
+    return _read_global_field_directory(plotfile_path, field)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", default="output", help="Directory with AMReX plotfiles `plt_XXXXXX`")
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="Directory with AMReX plotfiles `plt_XXXXXX` or `plt_XXXXXX.h5`",
+    )
     parser.add_argument("--step", type=int, default=None, help="Step to read (default: latest)")
     parser.add_argument(
         "--field",
@@ -315,10 +534,10 @@ def main() -> int:
         print(f"Step {step} not found. Available: {steps}", file=sys.stderr)
         return 1
 
-    plotfile_dir = plotfile_for_step(output_dir, step)
-    arr, meta = read_global_field(plotfile_dir, args.field)
+    plotfile_path = plotfile_for_step(output_dir, step)
+    arr, meta = read_global_field(plotfile_path, args.field)
 
-    print(f"Read field={args.field} at step={step} from plotfile {plotfile_dir.name}")
+    print(f"Read field={args.field} at step={step} from plotfile {plotfile_path.name}")
     print(
         f"Grid={meta['global_nx']}x{meta['global_ny']}  "
         f"dx={meta['dx']:.6g} dy={meta['dy']:.6g}  time={meta['time']:.6g}  levels={meta['finest_level'] + 1}"

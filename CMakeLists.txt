@@ -12,11 +12,49 @@ set(AMReX_GPU_BACKEND NONE CACHE STRING "")
 set(AMReX_PLOTFILE_TOOLS NO CACHE BOOL "")
 set(AMReX_FORTRAN NO CACHE BOOL "")
 set(AMReX_FFT YES CACHE BOOL "" FORCE)
+set(AMReX_HDF5 YES CACHE BOOL "" FORCE)
+set(AMReX_PARTICLES NO CACHE BOOL "" FORCE)
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG QUIET)
 
+if (AMReX_HDF5)
+    find_program(HDF5_MPI_C_COMPILER h5pcc)
+    if (HDF5_MPI_C_COMPILER AND NOT HDF5_C_COMPILER_EXECUTABLE)
+        set(HDF5_C_COMPILER_EXECUTABLE "${HDF5_MPI_C_COMPILER}" CACHE FILEPATH "Parallel HDF5 compiler wrapper")
+    endif()
+    if (HDF5_C_COMPILER_EXECUTABLE)
+        execute_process(
+            COMMAND "${HDF5_C_COMPILER_EXECUTABLE}" -show
+            OUTPUT_VARIABLE HDF5_WRAPPER_SHOW_OUTPUT
+            ERROR_VARIABLE HDF5_WRAPPER_SHOW_OUTPUT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        string(REGEX MATCHALL "(^| )-I[^ ]+" HDF5_WRAPPER_INCLUDE_FLAGS "${HDF5_WRAPPER_SHOW_OUTPUT}")
+        foreach(_hdf5_include_flag IN LISTS HDF5_WRAPPER_INCLUDE_FLAGS)
+            string(STRIP "${_hdf5_include_flag}" _hdf5_include_flag)
+            string(REGEX REPLACE "^-I" "" _hdf5_include_dir "${_hdf5_include_flag}")
+            list(APPEND HDF5_WRAPPER_INCLUDE_DIRS "${_hdf5_include_dir}")
+        endforeach()
+        list(REMOVE_DUPLICATES HDF5_WRAPPER_INCLUDE_DIRS)
+    endif()
+endif()
+
 add_subdirectory(external/amrex)
+
+if (AMReX_HDF5)
+    set(AMREX_LIB_TARGET "amrex_${AMReX_SPACEDIM}d")
+    if (TARGET ${AMREX_LIB_TARGET})
+        if (HDF5_WRAPPER_INCLUDE_DIRS)
+            # Ensure AMReX sees the HDF5 headers that match the linked parallel HDF5 library
+            # even when another package manager has a different hdf5.h on the default include path.
+            target_include_directories(${AMREX_LIB_TARGET} BEFORE PUBLIC ${HDF5_WRAPPER_INCLUDE_DIRS})
+            foreach(_hdf5_include_dir IN LISTS HDF5_WRAPPER_INCLUDE_DIRS)
+                target_compile_options(${AMREX_LIB_TARGET} BEFORE PUBLIC "-I${_hdf5_include_dir}")
+            endforeach()
+        endif()
+    endif()
+endif()
 
 add_executable(qhd_emhd
     src/main.cpp

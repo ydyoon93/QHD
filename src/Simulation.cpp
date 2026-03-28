@@ -1130,7 +1130,11 @@ void Simulation::write_output(int step, Real time) {
 
     std::ostringstream oss;
     oss << cfg_.output_dir << "/plt_" << std::setw(6) << std::setfill('0') << step;
+#ifdef AMREX_USE_HDF5
+    WriteSingleLevelPlotfileHDF5(oss.str(), plot_data, names, level_.geom, time, step);
+#else
     WriteSingleLevelPlotfile(oss.str(), plot_data, names, level_.geom, time, step);
+#endif
 }
 
 void Simulation::run() {

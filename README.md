@@ -24,6 +24,19 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
+If you have multiple MPI/HDF5 toolchains installed, clear the build directory and
+reconfigure with the desired toolchain first on `PATH`. On macOS with Homebrew
+MPI/HDF5 and Conda Python, a clean configure often looks like:
+
+```bash
+rm -rf build
+PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin cmake -S . -B build
+cmake --build build -j
+```
+
+The most common failure mode here is a stale `build/` cache mixing one MPI
+implementation with another HDF5 or OpenMP install.
+
 Run the short smoke test:
 
 ```bash
@@ -33,21 +46,26 @@ Run the short smoke test:
 Run the main example:
 
 ```bash
-./build/qhd_emhd config/simulation.py
+./build/qhd_emhd config/reconnection_viscous.py
 ```
 
-You can also use the legacy `.cfg` files:
+Other current Python examples:
 
 ```bash
-./build/qhd_emhd config/smoke.cfg
-./build/qhd_emhd config/simulation.cfg
+./build/qhd_emhd config/reconnection_Hesse.py
+./build/qhd_emhd config/turbulence.py
 ```
 
 The solver deletes and recreates the chosen `output_dir` at the start of each run.
 
 ## What You Edit
 
-The preferred input format is Python. The main example is `config/simulation.py`.
+The preferred input format is Python. The main examples are:
+
+- `config/smoke.py`
+- `config/reconnection_viscous.py`
+- `config/reconnection_Hesse.py`
+- `config/turbulence.py`
 
 Typical top-level parameters are:
 
@@ -60,19 +78,25 @@ The solver uses the user-specified `dt` directly. Only the last step may be shor
 
 ## Initial Conditions
 
-You can initialize either `B` or `Q` by defining Python functions:
+You can initialize `B`, `Q`, or `u` by defining Python functions:
 
 - `Bx(x, y)`, `By(x, y)`, `Bz(x, y)`
 - `Qx(x, y)`, `Qy(x, y)`, `Qz(x, y)`
+- `Ux(x, y)`, `Uy(x, y)`, `Uz(x, y)`
 
 If only `B` is provided, the solver computes `Q`.
 If only `Q` is provided, the solver solves for `B`.
+If only `u` is provided, the Python initialization helper reconstructs a periodic
+`B` field and the solver then computes `Q`.
+This `u`-only path is an inverse-curl reconstruction on the periodic grid, so
+it is best suited to velocity fields that are compatible with the EMHD
+staggering and periodic domain.
 
 These functions are evaluated on the solver staggering:
 
-- `Bx`, `Qx`: horizontal edges
-- `By`, `Qy`: vertical edges
-- `Bz`, `Qz`: cell faces
+- `Bx`, `Qx`, `Ux`: horizontal edges
+- `By`, `Qy`, `Uy`: vertical edges
+- `Bz`, `Qz`, `Uz`: cell faces
 
 ## Pressure Closure
 
@@ -110,9 +134,12 @@ The current embedded-Python path lets you write closures using normal NumPy oper
 
 ## Output
 
-The solver writes AMReX plotfiles:
+The solver writes AMReX HDF5 plotfiles:
 
-- `output/plt_XXXXXX`
+- `output/plt_XXXXXX.h5`
+
+The Python post-processing tools also continue to read legacy AMReX plotfile
+directories of the form `output/plt_XXXXXX`.
 
 The saved plotfile variables are cell-centered views of the staggered state:
 
@@ -130,6 +157,9 @@ Read a single field from a plotfile:
 python3 scripts/read_output.py --output-dir output --field Pxy --step 0
 ```
 
+`read_output.py` accepts either HDF5 plotfiles (`plt_XXXXXX.h5`) or legacy
+directory plotfiles (`plt_XXXXXX`).
+
 Open the interactive viewer:
 
 ```bash
@@ -143,13 +173,32 @@ The viewer shows:
 - `Uz` with in-plane `u` flux contours
 - `Pxy` with the current AMReX grid layout
 
+If you want one fixed scale across all available timesteps, use:
+
+```bash
+python3 scripts/view_output_slider.py --output-dir output --fixed-scale
+```
+
+That fixed-scale path now uses robust global limits scanned over all steps,
+with percentile clipping to suppress outliers. You can tune the clipping with
+`--outlier-percentile`.
+
 Export an MP4 movie:
 
 ```bash
 python3 scripts/make_output_movie.py --output-dir output --mp4 output.mp4 --fps 5
 ```
 
-That is a good default for a run that writes about 100 frames.
+The movie tool now uses one robust global color scale by default across the
+selected timesteps, rather than rescaling every frame independently. It clips
+outliers per tail when computing the global limits, with a default of `1.0`
+percent:
+
+```bash
+python3 scripts/make_output_movie.py --output-dir output --mp4 output.mp4 --outlier-percentile 1.0
+```
+
+If you want the old per-frame rescaling behavior, add `--dynamic-scale`.
 
 ## Build Requirements
 
@@ -160,8 +209,10 @@ The code expects:
 - MPI
 - OpenMP
 - FFTW, because the Helmholtz inversion uses AMReX FFT on CPU
+- parallel HDF5, because plotfile output now uses the AMReX HDF5 writer
 - Python 3 interpreter and development headers
 - `pybind11` headers, either from a normal install or from a vendored include tree such as PyTorch
+- `h5py` if you want the Python readers and plotting tools to read HDF5 plotfiles
 
 ## Numerical Model
 

@@ -19,6 +19,7 @@ from read_output import discover_steps
 from view_output_slider import (
     VECTOR_FIELDS,
     cell_center_axes,
+    compute_global_display_limits,
     compute_fluxes,
     draw_grid_layout,
     load_step,
@@ -28,19 +29,30 @@ from view_output_slider import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", default="output", help="Directory with AMReX plotfiles `plt_XXXXXX`")
+    parser.add_argument("--output-dir", default="output", help="Directory with AMReX plotfiles `plt_XXXXXX` or `plt_XXXXXX.h5`")
     parser.add_argument("--mp4", default=None, help="Output MP4 path (default: sibling of output dir)")
-    parser.add_argument("--fps", type=float, default=5.0, help="Video frame rate")
+    parser.add_argument("--fps", type=float, default=10.0, help="Video frame rate")
     parser.add_argument("--start-step", type=int, default=None, help="First step to render")
     parser.add_argument("--end-step", type=int, default=None, help="Last step to render")
     parser.add_argument("--every", type=int, default=1, help="Render every Nth plotfile")
     parser.add_argument("--levels", type=int, default=16, help="Number of contour levels for Q/B/u panels")
     parser.add_argument("--cmap", default="RdBu_r", help="Matplotlib colormap for z-component background")
-    parser.add_argument("--dpi", type=int, default=140, help="Figure DPI for MP4 encoding")
+    parser.add_argument("--dpi", type=int, default=300, help="Figure DPI for MP4 encoding")
+    parser.add_argument(
+        "--global-scale",
+        action="store_true",
+        help="Deprecated alias for the default robust global scaling behavior",
+    )
     parser.add_argument(
         "--dynamic-scale",
         action="store_true",
-        help="Recompute color and contour limits per frame instead of fixing them over the full movie",
+        help="Recompute color and contour limits per frame instead of using one robust global scale",
+    )
+    parser.add_argument(
+        "--outlier-percentile",
+        type=float,
+        default=1.0,
+        help="Clip this percentile from each tail when computing global ranges (default: 1.0)",
     )
     return parser.parse_args()
 
@@ -52,41 +64,6 @@ def default_mp4_path(output_dir: pathlib.Path) -> pathlib.Path:
 def select_steps(all_steps: list[int], start: int | None, end: int | None, every: int) -> list[int]:
     steps = [step for step in all_steps if (start is None or step >= start) and (end is None or step <= end)]
     return steps[::every]
-
-
-def compute_global_limits(output_dir: pathlib.Path, steps: list[int]) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]], tuple[float, float]]:
-    z_limits: dict[str, list[float]] = {name: [np.inf, -np.inf] for name in VECTOR_FIELDS}
-    contour_limits: dict[str, list[float]] = {name: [np.inf, -np.inf] for name in VECTOR_FIELDS}
-    pxy_limits = [np.inf, -np.inf]
-
-    for idx, step in enumerate(steps, start=1):
-        arrays, meta = load_step(str(output_dir), step)
-        if "Pxy" not in arrays:
-            raise RuntimeError(f"Pxy is not available in plotfile for step {step}")
-        fluxes = compute_fluxes(arrays, meta)
-
-        for name in VECTOR_FIELDS:
-            z = arrays[VECTOR_FIELDS[name][2]]
-            psi = fluxes[name]
-            z_vmin, z_vmax = safe_limits(z)
-            psi_vmin, psi_vmax = safe_limits(psi)
-            z_limits[name][0] = min(z_limits[name][0], z_vmin)
-            z_limits[name][1] = max(z_limits[name][1], z_vmax)
-            contour_limits[name][0] = min(contour_limits[name][0], psi_vmin)
-            contour_limits[name][1] = max(contour_limits[name][1], psi_vmax)
-
-        pxy_vmin, pxy_vmax = safe_limits(arrays["Pxy"])
-        pxy_limits[0] = min(pxy_limits[0], pxy_vmin)
-        pxy_limits[1] = max(pxy_limits[1], pxy_vmax)
-
-        if idx == 1 or idx == len(steps) or idx % 10 == 0:
-            print(f"[scan] {idx}/{len(steps)} steps", file=sys.stderr)
-
-    return (
-        {name: (limits[0], limits[1]) for name, limits in z_limits.items()},
-        {name: (limits[0], limits[1]) for name, limits in contour_limits.items()},
-        (pxy_limits[0], pxy_limits[1]),
-    )
 
 
 def draw_frame(
@@ -183,7 +160,11 @@ def main() -> int:
     contour_limits = None
     pxy_limits = None
     if not args.dynamic_scale:
-        z_limits, contour_limits, pxy_limits = compute_global_limits(output_dir, steps)
+        z_limits, contour_limits, pxy_limits = compute_global_display_limits(
+            output_dir,
+            steps,
+            args.outlier_percentile,
+        )
 
     fig = plt.figure(figsize=(12.6, 10.2))
     writer = FFMpegWriter(fps=args.fps, codec="libx264")
