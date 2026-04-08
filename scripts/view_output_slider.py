@@ -6,20 +6,23 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache, partial
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 from matplotlib.widgets import Slider
 import numpy as np
 
-from read_output import discover_steps, plotfile_for_step, read_global_field, read_grid_layout
+from read_output import discover_steps, plotfile_for_step, read_global_fields, read_grid_layout
 
 VECTOR_FIELDS = {
     "Q": ("Qx", "Qy", "Qz"),
     "B": ("Bx", "By", "Bz"),
     "u": ("Ux", "Uy", "Uz"),
 }
+
+B_CONTOUR_COLOR = "black"
+CANONICAL_CONTOUR_COLOR = "green"
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-step", type=int, default=None, help="Initial step (default: latest)")
     parser.add_argument("--levels", type=int, default=16, help="Number of contour levels per subplot")
     parser.add_argument("--cmap", default="RdBu_r", help="Matplotlib colormap for z-component background")
+    parser.add_argument(
+        "--current-component",
+        choices=["Jx", "Jy", "Jz", "Jmag"],
+        default="Jz",
+        help="Current-density quantity to show in the lower-right panel",
+    )
     parser.add_argument(
         "--fixed-scale",
         action="store_true",
@@ -104,6 +113,25 @@ def inplane_flux_function(fx: np.ndarray, fy: np.ndarray, dx: float, dy: float) 
     return psi
 
 
+def periodic_derivative(arr: np.ndarray, spacing: float, axis: int) -> np.ndarray:
+    return (np.roll(arr, -1, axis=axis) - np.roll(arr, 1, axis=axis)) / (2.0 * spacing)
+
+
+def compute_current_fields(arrays: dict[str, np.ndarray], meta: dict) -> dict[str, np.ndarray]:
+    dx = float(meta["dx"])
+    dy = float(meta["dy"])
+    bx = arrays["Bx"]
+    by = arrays["By"]
+    bz = arrays["Bz"]
+
+    jx = periodic_derivative(bz, dy, axis=0)
+    jy = -periodic_derivative(bz, dx, axis=1)
+    jz = periodic_derivative(by, dx, axis=1) - periodic_derivative(bx, dy, axis=0)
+    jmag = np.sqrt(jx**2 + jy**2 + jz**2)
+
+    return {"Jx": jx, "Jy": jy, "Jz": jz, "Jmag": jmag}
+
+
 @lru_cache(maxsize=8)
 def load_step(output_dir_str: str, step: int) -> tuple[dict[str, np.ndarray], dict]:
     output_dir = pathlib.Path(output_dir_str)
@@ -111,30 +139,20 @@ def load_step(output_dir_str: str, step: int) -> tuple[dict[str, np.ndarray], di
     if not plotfile_dir.exists():
         raise RuntimeError(f"No plotfile found for step {step}")
 
-    arrays: dict[str, np.ndarray] = {}
-    meta = read_grid_layout(plotfile_dir)
-
-    for field_x, field_y, field_z in VECTOR_FIELDS.values():
-        arr_x, meta_x = read_global_field(plotfile_dir, field_x)
-        arr_y, meta_y = read_global_field(plotfile_dir, field_y)
-        arr_z, meta_z = read_global_field(plotfile_dir, field_z)
-        arrays[field_x] = arr_x
-        arrays[field_y] = arr_y
-        arrays[field_z] = arr_z
-        meta["time"] = meta_x["time"]
-        if (
-            meta_x["global_nx"] != meta_y["global_nx"]
-            or meta_x["global_ny"] != meta_y["global_ny"]
-            or meta_x["global_nx"] != meta_z["global_nx"]
-            or meta_x["global_ny"] != meta_z["global_ny"]
-        ):
-            raise RuntimeError("Inconsistent metadata between vector components")
+    requested_fields = [field for components in VECTOR_FIELDS.values() for field in components]
+    requested_fields.append("Pxy")
 
     try:
-        arrays["Pxy"], _ = read_global_field(plotfile_dir, "Pxy")
-    except RuntimeError:
-        pass
+        arrays, field_meta = read_global_fields(plotfile_dir, requested_fields)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Field(s) 'Pxy'" not in message:
+            raise
+        arrays, field_meta = read_global_fields(plotfile_dir, requested_fields[:-1])
 
+    meta = read_grid_layout(plotfile_dir)
+    meta["time"] = field_meta["time"]
+    meta["step"] = field_meta["step"]
     return arrays, meta
 
 
@@ -147,36 +165,67 @@ def compute_fluxes(arrays: dict[str, np.ndarray], meta: dict) -> dict[str, np.nd
     return fluxes
 
 
+def _scan_display_limits_for_step(
+    output_dir_str: str,
+    step: int,
+    current_component: str,
+    outlier_percentile: float,
+) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]], tuple[float, float]]:
+    arrays, meta = load_step(output_dir_str, step)
+    fluxes = compute_fluxes(arrays, meta)
+    currents = compute_current_fields(arrays, meta)
+    z_limits_now: dict[str, tuple[float, float]] = {}
+    contour_limits_now: dict[str, tuple[float, float]] = {}
+    for name in VECTOR_FIELDS:
+        z_limits_now[name] = robust_limits(arrays[VECTOR_FIELDS[name][2]], outlier_percentile)
+        contour_limits_now[name] = robust_limits(fluxes[name], outlier_percentile)
+    return z_limits_now, contour_limits_now, robust_limits(currents[current_component], outlier_percentile)
+
+
 def compute_global_display_limits(
     output_dir: pathlib.Path,
     steps: list[int],
+    current_component: str,
     outlier_percentile: float,
+    workers: int = 1,
 ) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]], tuple[float, float]]:
     z_limits_per_step: dict[str, list[tuple[float, float]]] = {name: [] for name in VECTOR_FIELDS}
     contour_limits_per_step: dict[str, list[tuple[float, float]]] = {name: [] for name in VECTOR_FIELDS}
-    pxy_limits_per_step: list[tuple[float, float]] = []
+    current_limits_per_step: list[tuple[float, float]] = []
 
-    for idx, step in enumerate(steps, start=1):
-        arrays, meta = load_step(str(output_dir), step)
-        if "Pxy" not in arrays:
-            raise RuntimeError(f"Pxy is not available in plotfile for step {step}")
-        fluxes = compute_fluxes(arrays, meta)
+    worker_count = max(1, int(workers))
+    worker_fn = partial(
+        _scan_display_limits_for_step,
+        str(output_dir),
+        current_component=current_component,
+        outlier_percentile=outlier_percentile,
+    )
 
-        for name in VECTOR_FIELDS:
-            z = arrays[VECTOR_FIELDS[name][2]]
-            psi = fluxes[name]
-            z_limits_per_step[name].append(robust_limits(z, outlier_percentile))
-            contour_limits_per_step[name].append(robust_limits(psi, outlier_percentile))
+    if worker_count == 1:
+        step_limits_iter = map(worker_fn, steps)
+        executor = None
+    else:
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        step_limits_iter = executor.map(worker_fn, steps)
 
-        pxy_limits_per_step.append(robust_limits(arrays["Pxy"], outlier_percentile))
+    try:
+        for idx, (z_now, contour_now, current_now) in enumerate(step_limits_iter, start=1):
+            for name in VECTOR_FIELDS:
+                z_limits_per_step[name].append(z_now[name])
+                contour_limits_per_step[name].append(contour_now[name])
 
-        if idx == 1 or idx == len(steps) or idx % 10 == 0:
-            print(f"[scan] {idx}/{len(steps)} steps", file=sys.stderr)
+            current_limits_per_step.append(current_now)
+
+            if idx == 1 or idx == len(steps) or idx % 10 == 0:
+                print(f"[scan] {idx}/{len(steps)} steps", file=sys.stderr)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     return (
         {name: merge_limits(limits) for name, limits in z_limits_per_step.items()},
         {name: merge_limits(limits) for name, limits in contour_limits_per_step.items()},
-        merge_limits(pxy_limits_per_step),
+        merge_limits(current_limits_per_step),
     )
 
 
@@ -198,21 +247,25 @@ def cell_center_axes(meta: dict) -> tuple[np.ndarray, np.ndarray, tuple[float, f
 def draw_grid_layout(
     ax: plt.Axes,
     meta: dict,
-    pxy: np.ndarray,
+    scalar: np.ndarray,
+    scalar_label: str,
     cmap: str,
+    x: np.ndarray | None = None,
+    y: np.ndarray | None = None,
+    b_psi: np.ndarray | None = None,
+    q_psi: np.ndarray | None = None,
+    levels: int | None = None,
+    b_limits: tuple[float, float] | None = None,
+    q_limits: tuple[float, float] | None = None,
     vmin: float | None = None,
     vmax: float | None = None,
 ):
     prob_lo_x, prob_lo_y = float(meta["prob_lo"][0]), float(meta["prob_lo"][1])
     prob_hi_x, prob_hi_y = float(meta["prob_hi"][0]), float(meta["prob_hi"][1])
-    domain_width = prob_hi_x - prob_lo_x
-    domain_height = prob_hi_y - prob_lo_y
-    nx = int(meta["global_nx"])
-    ny = int(meta["global_ny"])
 
     ax.clear()
     image = ax.imshow(
-        pxy,
+        scalar,
         origin="lower",
         cmap=cmap,
         interpolation="nearest",
@@ -220,37 +273,29 @@ def draw_grid_layout(
         vmin=vmin,
         vmax=vmax,
     )
-    ax.add_patch(
-        Rectangle(
-            (prob_lo_x, prob_lo_y),
-            domain_width,
-            domain_height,
-            fill=False,
-            edgecolor="black",
-            linewidth=1.4,
+
+    if x is not None and y is not None and b_psi is not None and levels is not None:
+        b_vmin, b_vmax = safe_limits(b_psi) if b_limits is None else b_limits
+        ax.contour(
+            x,
+            y,
+            b_psi,
+            levels=np.linspace(b_vmin, b_vmax, levels),
+            linewidths=0.8,
+            colors=B_CONTOUR_COLOR,
         )
-    )
+    if x is not None and y is not None and q_psi is not None and levels is not None:
+        q_vmin, q_vmax = safe_limits(q_psi) if q_limits is None else q_limits
+        ax.contour(
+            x,
+            y,
+            q_psi,
+            levels=np.linspace(q_vmin, q_vmax, levels),
+            linewidths=0.8,
+            colors=CANONICAL_CONTOUR_COLOR,
+        )
 
-    level_colors = ["#4C78A8", "#E45756", "#54A24B", "#B279A2"]
-    for level in meta["levels"]:
-        color = level_colors[level["level"] % len(level_colors)]
-        for box in level["boxes"]:
-            x0 = prob_lo_x + domain_width * (box["lo_x"] / nx)
-            y0 = prob_lo_y + domain_height * (box["lo_y"] / ny)
-            width = domain_width * ((box["hi_x"] - box["lo_x"]) / nx)
-            height = domain_height * ((box["hi_y"] - box["lo_y"]) / ny)
-            ax.add_patch(
-                Rectangle(
-                    (x0, y0),
-                    width,
-                    height,
-                    fill=False,
-                    edgecolor=color,
-                    linewidth=1.2 if level["level"] > 0 else 1.0,
-                )
-            )
-
-    ax.set_title("Pxy with current grid layout")
+    ax.set_title(f"{scalar_label} + B/Q flux contours")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_xlim(prob_lo_x, prob_hi_x)
@@ -258,10 +303,9 @@ def draw_grid_layout(
     ax.set_aspect("equal")
     ax.grid(False)
 
-    legend_lines = [
-        plt.Line2D([0], [0], color=level_colors[level["level"] % len(level_colors)], lw=1.5, label=f"Level {level['level']}")
-        for level in meta["levels"]
-    ]
+    legend_lines = []
+    legend_lines.append(plt.Line2D([0], [0], color=B_CONTOUR_COLOR, lw=1.5, label="B flux"))
+    legend_lines.append(plt.Line2D([0], [0], color=CANONICAL_CONTOUR_COLOR, lw=1.5, label="Canonical flux"))
     ax.legend(handles=legend_lines, loc="upper right", frameon=True, fontsize=8)
     return image
 
@@ -289,11 +333,9 @@ def main() -> int:
 
     first_step = steps[step_idx]
     arrays, meta = load_step(str(output_dir), first_step)
-    if "Pxy" not in arrays:
-        print(f"Pxy is not available in plotfile for step {first_step}", file=sys.stderr)
-        return 1
     fluxes = compute_fluxes(arrays, meta)
-    pxy = arrays["Pxy"]
+    currents = compute_current_fields(arrays, meta)
+    current_panel = currents[args.current_component]
     x, y, extent = cell_center_axes(meta)
 
     fig, axes = plt.subplots(2, 2, figsize=(12.6, 10.2))
@@ -305,7 +347,7 @@ def main() -> int:
     colorbars = {}
     contour_limits = {}
     z_limits = {}
-    pxy_limits = safe_limits(pxy)
+    current_limits = safe_limits(current_panel)
     for ax, name in zip(field_axes, ["Q", "B", "u"]):
         field_z = VECTOR_FIELDS[name][2]
         z = arrays[field_z]
@@ -338,32 +380,40 @@ def main() -> int:
     images["pxy"] = draw_grid_layout(
         grid_ax,
         meta,
-        pxy,
-        "viridis",
-        vmin=pxy_limits[0],
-        vmax=pxy_limits[1],
+        current_panel,
+        args.current_component,
+        "viridis" if args.current_component == "Jmag" else args.cmap,
+        x=x,
+        y=y,
+        b_psi=fluxes["B"],
+        q_psi=fluxes["Q"],
+        levels=args.levels,
+        b_limits=contour_limits["B"],
+        q_limits=contour_limits["Q"],
+        vmin=current_limits[0],
+        vmax=current_limits[1],
     )
     colorbars["pxy"] = fig.colorbar(images["pxy"], ax=grid_ax, fraction=0.046, pad=0.04)
-    colorbars["pxy"].set_label("Pxy")
+    colorbars["pxy"].set_label(args.current_component)
 
     if args.fixed_scale:
-        z_limits, contour_limits, pxy_limits = compute_global_display_limits(
+        z_limits, contour_limits, current_limits = compute_global_display_limits(
             output_dir,
             steps,
+            args.current_component,
             args.outlier_percentile,
         )
     else:
         z_limits = None
         contour_limits = None
-        pxy_limits = None
+        current_limits = None
 
     def draw(index: int) -> None:
         step = steps[index]
         arrays_now, meta_now = load_step(str(output_dir), step)
         fluxes_now = compute_fluxes(arrays_now, meta_now)
-        if "Pxy" not in arrays_now:
-            raise RuntimeError(f"Pxy is not available in plotfile for step {step}")
-        pxy_now = arrays_now["Pxy"]
+        currents_now = compute_current_fields(arrays_now, meta_now)
+        current_now = currents_now[args.current_component]
         x_now, y_now, extent_now = cell_center_axes(meta_now)
 
         for ax, name in zip(field_axes, ["Q", "B", "u"]):
@@ -399,18 +449,26 @@ def main() -> int:
             ax.set_aspect("equal")
             colorbars[name].update_normal(images[name])
 
-        if pxy_limits is None:
-            pxy_vmin, pxy_vmax = safe_limits(pxy_now)
+        if current_limits is None:
+            current_vmin, current_vmax = safe_limits(current_now)
         else:
-            pxy_vmin, pxy_vmax = pxy_limits
+            current_vmin, current_vmax = current_limits
 
         images["pxy"] = draw_grid_layout(
             grid_ax,
             meta_now,
-            pxy_now,
-            "viridis",
-            vmin=pxy_vmin,
-            vmax=pxy_vmax,
+            current_now,
+            args.current_component,
+            "viridis" if args.current_component == "Jmag" else args.cmap,
+            x=x_now,
+            y=y_now,
+            b_psi=fluxes_now["B"],
+            q_psi=fluxes_now["Q"],
+            levels=args.levels,
+            b_limits=None if contour_limits is None else contour_limits["B"],
+            q_limits=None if contour_limits is None else contour_limits["Q"],
+            vmin=current_vmin,
+            vmax=current_vmax,
         )
         colorbars["pxy"].update_normal(images["pxy"])
 
